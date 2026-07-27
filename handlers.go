@@ -19,15 +19,17 @@ type StockHandler struct {
 	fetcher    *StockFetcher
 	tdx        *TdxDataSource
 	nodeStore  *NodeConfigStore
+	quoteCache *QuoteCache
 	debug      bool
 }
 
 // NewStockHandler 创建处理器
-func NewStockHandler(fetcher *StockFetcher, tdx *TdxDataSource, nodeStore *NodeConfigStore, debug bool) *StockHandler {
+func NewStockHandler(fetcher *StockFetcher, tdx *TdxDataSource, nodeStore *NodeConfigStore, quoteCache *QuoteCache, debug bool) *StockHandler {
 	return &StockHandler{
 		fetcher:   fetcher,
 		tdx:       tdx,
 		nodeStore: nodeStore,
+		quoteCache: quoteCache,
 		debug:     debug,
 	}
 }
@@ -320,10 +322,13 @@ func (h *StockHandler) HandleRealtime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	now := time.Now()
 	h.sendJSON(w, 200, map[string]interface{}{
 		"code":      200,
 		"data":      data,
-		"timestamp": time.Now().Format(time.RFC3339),
+		"stale":     false,
+		"price_ts":  now.Format(time.RFC3339),
+		"timestamp": now.Format(time.RFC3339),
 	})
 	h.logResponse(200, start)
 }
@@ -375,6 +380,8 @@ func (h *StockHandler) HandleKline(w http.ResponseWriter, r *http.Request) {
 	h.sendJSON(w, 200, map[string]interface{}{
 		"code":      200,
 		"data":      data,
+		"stale":     false,
+		"price_ts":  time.Now().Format(time.RFC3339),
 		"timestamp": time.Now().Format(time.RFC3339),
 	})
 	h.logResponse(200, start)
@@ -423,6 +430,297 @@ func (h *StockHandler) HandleIntraday(w http.ResponseWriter, r *http.Request) {
 		"code":      200,
 		"data":      data,
 		"timestamp": time.Now().Format(time.RFC3339),
+	})
+	h.logResponse(200, start)
+}
+
+// ── 批量实时行情 ──────────────────────────────────────────────────────────────
+
+// fetchBatchQuotes 批量行情取数：腾讯 HTTP 全量 + TDX 真实时覆盖（三层兜底）。
+func (h *StockHandler) fetchBatchQuotes(codes []string) map[string]*QuoteRecord {
+	// 腾讯 HTTP：一次取全部（含名称 / 昨收 / 开盘 / 实时价）
+	ten, tenErr := h.fetcher.FetchBatchQuotes(codes)
+	if tenErr != nil && h.debug {
+		log.Printf("[BATCH] 腾讯批量失败: %v", tenErr)
+	}
+	if ten == nil {
+		ten = make(map[string]*QuoteRecord)
+	}
+
+	// TDX 优先生效（真实时 / 昨收兜底）
+	if h.tdx != nil && h.tdx.Enabled() {
+		tq, err := h.tdx.GetBatchQuotes(codes)
+		if err != nil && h.debug {
+			log.Printf("[BATCH] TDX 批量失败: %v", err)
+		}
+		for code, q := range tq {
+			if existing, ok := ten[code]; ok && existing != nil {
+				if q.Price > 0 {
+					existing.Price = q.Price
+					existing.High = q.High
+					existing.Low = q.Low
+					existing.PriceSource = "" // 实时价
+				} else if q.PriceSource == "last_close" {
+					existing.Price = q.Price
+					existing.PriceSource = "last_close"
+				}
+			}
+		}
+	}
+
+	// 无 TDX 时，腾讯价即实时价（非 close 兜底）
+	if h.tdx == nil || !h.tdx.Enabled() {
+		for _, rec := range ten {
+			if rec != nil {
+				rec.PriceSource = ""
+			}
+		}
+	}
+	return ten
+}
+
+// HandleBatchQuotes 批量实时行情（一次取多只）
+func (h *StockHandler) HandleBatchQuotes(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	h.logRequest(r)
+
+	codesParam := r.URL.Query().Get("codes")
+	if codesParam == "" {
+		h.sendJSON(w, 400, map[string]interface{}{"code": 400, "message": "缺少 codes 参数"})
+		return
+	}
+	codes := make([]string, 0)
+	for _, c := range strings.Split(codesParam, ",") {
+		c = strings.TrimSpace(c)
+		if c != "" {
+			codes = append(codes, c)
+		}
+	}
+	if len(codes) == 0 {
+		h.sendJSON(w, 400, map[string]interface{}{"code": 400, "message": "缺少股票代码"})
+		return
+	}
+
+	result := h.fetchBatchQuotes(codes)
+	if len(result) == 0 {
+		h.sendJSON(w, 503, map[string]interface{}{"code": 503, "message": "无可用数据源"})
+		return
+	}
+
+	// 写入共享缓存（与 /api/quote_cache 同源）
+	h.quoteCache.UpsertMany(result)
+
+	anyStale := false
+	for _, rec := range result {
+		if rec.Stale {
+			anyStale = true
+		}
+	}
+
+	now := time.Now()
+	h.sendJSON(w, 200, map[string]interface{}{
+		"code":      200,
+		"message":   "success",
+		"data":      result,
+		"stale":     anyStale,
+		"timestamp": now.Format(time.RFC3339),
+	})
+	h.logResponse(200, start)
+}
+
+// ── 前复权日 K 线 ─────────────────────────────────────────────────────────────
+
+// HandleQfq 前复权日 K 线（供昨收兜底）
+func (h *StockHandler) HandleQfq(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	h.logRequest(r)
+
+	code := extractPathSuffix(r.URL.Path, "/api/qfq/")
+	if code == "" {
+		h.sendJSON(w, 400, map[string]interface{}{"code": 400, "message": "缺少股票代码"})
+		return
+	}
+
+	days := 30
+	if d := r.URL.Query().Get("days"); d != "" {
+		if v, err := strconv.Atoi(d); err == nil && v > 0 {
+			days = v
+		}
+	}
+
+	resp, source, unadjusted, err := h.fetcher.FetchQfq(code, days)
+	if err != nil || resp == nil || resp.Count == 0 {
+		h.sendJSON(w, 503, map[string]interface{}{
+			"code":    503,
+			"message": fmt.Sprintf("前复权K线不可用: %v", err),
+		})
+		return
+	}
+
+	// 盘中补「当日根」：网络前复权源不含未收盘当日 K 线，末根停在昨天，
+	// 补上后末根 open 才是真正的今开（与 Python ensure_today_open 对齐）。
+	resp = h.ensureTodayOpen(resp, code)
+
+	now := time.Now()
+	h.sendJSON(w, 200, map[string]interface{}{
+		"code": 200,
+		"data": map[string]interface{}{
+			"code":       code,
+			"name":       resp.Name,
+			"count":      resp.Count,
+			"data":       resp.Data,
+			"stale":      false,
+			"price_ts":   now.Format(time.RFC3339),
+			"source":     source,
+			"unadjusted": unadjusted,
+		},
+		"timestamp": now.Format(time.RFC3339),
+	})
+	h.logResponse(200, start)
+}
+
+// ensureTodayOpen 若 qfq 末根不是今天，则用 TDX 未复权当日日线补一根（前复权锚定最新交易日，无跳变）
+func (h *StockHandler) ensureTodayOpen(resp *KlineResponse, code string) *KlineResponse {
+	if resp == nil || len(resp.Data) == 0 {
+		return resp
+	}
+	today := time.Now().Format("2006-01-02")
+	if resp.Data[len(resp.Data)-1].Date >= today {
+		return resp
+	}
+	if h.tdx != nil && h.tdx.Enabled() {
+		dayResp, err := h.tdx.GetKline(code, 1)
+		if err == nil && dayResp != nil && dayResp.Count > 0 {
+			bar := dayResp.Data[0]
+			if bar.Date == today || bar.Date == strings.ReplaceAll(today, "-", "") {
+				resp.Data = append(resp.Data, KlineRecord{
+					Date:   today,
+					Open:   bar.Open,
+					Close:  bar.Close,
+					High:   bar.High,
+					Low:    bar.Low,
+					Volume: bar.Volume,
+				})
+				resp.Count = len(resp.Data)
+			}
+		}
+	}
+	return resp
+}
+
+// ── 股票名称 ─────────────────────────────────────────────────────────────────
+
+// HandleName 股票名称查询
+func (h *StockHandler) HandleName(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	h.logRequest(r)
+
+	code := extractPathSuffix(r.URL.Path, "/api/name/")
+	if code == "" {
+		h.sendJSON(w, 400, map[string]interface{}{"code": 400, "message": "缺少股票代码"})
+		return
+	}
+
+	name, err := h.fetcher.FetchName(code)
+	if err != nil {
+		name = "" // 解析不到时返回空串（客户端按取不到名降级），不返回 404
+	}
+
+	now := time.Now()
+	h.sendJSON(w, 200, map[string]interface{}{
+		"code": 200,
+		"data": map[string]interface{}{
+			"code": code,
+			"name": name,
+		},
+		"timestamp": now.Format(time.RFC3339),
+	})
+	h.logResponse(200, start)
+}
+
+// ── 分钟 K 线 ────────────────────────────────────────────────────────────────
+
+// HandleMinute 分钟 K 线（原始 OHLC 棒，供分时检测复用）
+func (h *StockHandler) HandleMinute(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	h.logRequest(r)
+
+	code := extractPathSuffix(r.URL.Path, "/api/minute/")
+	if code == "" {
+		h.sendJSON(w, 400, map[string]interface{}{"code": 400, "message": "缺少股票代码"})
+		return
+	}
+
+	period := 7
+	if p := r.URL.Query().Get("period"); p != "" {
+		if v, err := strconv.Atoi(p); err == nil {
+			period = v
+		}
+	}
+	minutes := 300
+	if m := r.URL.Query().Get("minutes"); m != "" {
+		if v, err := strconv.Atoi(m); err == nil {
+			minutes = v
+		}
+	}
+
+	var data *MinuteResponse
+	var err error
+	if h.tdx != nil && h.tdx.Enabled() {
+		data, err = h.tdx.GetMinute(code, period, minutes)
+	}
+	if err != nil || data == nil || data.Count == 0 {
+		h.sendJSON(w, 503, map[string]interface{}{
+			"code":    503,
+			"message": fmt.Sprintf("无可用分钟数据源: %v", err),
+		})
+		return
+	}
+
+	now := time.Now()
+	h.sendJSON(w, 200, map[string]interface{}{
+		"code": 200,
+		"data": map[string]interface{}{
+			"code":  code,
+			"count": data.Count,
+			"data":  data.Data,
+		},
+		"timestamp": now.Format(time.RFC3339),
+	})
+	h.logResponse(200, start)
+}
+
+// ── 实时价格缓存 ─────────────────────────────────────────────────────────────
+
+// HandleQuoteCache 实时价格缓存（进程内共享，对标 Python cn_quote_cache）
+func (h *StockHandler) HandleQuoteCache(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	h.logRequest(r)
+
+	codesParam := r.URL.Query().Get("codes")
+	now := time.Now()
+
+	var data map[string]*QuoteCacheEntry
+	if codesParam != "" {
+		data = make(map[string]*QuoteCacheEntry)
+		for _, c := range strings.Split(codesParam, ",") {
+			c = strings.TrimSpace(c)
+			if c == "" {
+				continue
+			}
+			if rec := h.quoteCache.Get(c); rec != nil {
+				data[rec.Code] = rec
+			}
+		}
+	} else {
+		data = h.quoteCache.GetAll()
+	}
+
+	h.sendJSON(w, 200, map[string]interface{}{
+		"code":      200,
+		"message":   "success",
+		"data":      data,
+		"timestamp": now.Format(time.RFC3339),
 	})
 	h.logResponse(200, start)
 }

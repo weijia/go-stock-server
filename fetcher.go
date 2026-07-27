@@ -2,6 +2,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +12,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
 )
 
 // StockFetcher 股票数据获取器
@@ -102,7 +107,21 @@ func (f *StockFetcher) httpGet(url string) (string, error) {
 		return "", err
 	}
 
+	// 腾讯实时行情接口 qt.gtimg.cn 返回 GBK 编码，需转 UTF-8；K线接口为 UTF-8 JSON。
+	if strings.Contains(url, "qt.gtimg.cn") {
+		return gbkToUtf8(body), nil
+	}
 	return string(body), nil
+}
+
+// gbkToUtf8 将 GBK 字节流转为 UTF-8 字符串（解析失败时回退原字节）
+func gbkToUtf8(b []byte) string {
+	reader := transform.NewReader(bytes.NewReader(b), simplifiedchinese.GBK.NewDecoder())
+	out, err := io.ReadAll(reader)
+	if err != nil {
+		return string(b)
+	}
+	return string(out)
 }
 
 // parseRealtime 解析实时行情
@@ -146,58 +165,48 @@ func (f *StockFetcher) parseRealtime(content, code string) (*RealtimeData, error
 	}, nil
 }
 
-// parseKline 解析 K 线数据
+// parseKline 解析 K 线数据（标准 JSON 解码，覆盖 qfqday / day 两种字段）
 func (f *StockFetcher) parseKline(content, code string, days int) (*KlineResponse, error) {
-	// 腾讯 K 线 API 返回 JSON
-	rawData := content
+	key := fmt.Sprintf("%s%s", marketPrefix(code), code)
 
-	// 简单 JSON 解析（避免引入第三方 JSON 库）
-	type TKlineData struct {
+	var root struct {
 		Code int `json:"code"`
 		Data map[string]struct {
 			QfqDay [][]interface{} `json:"qfqday"`
 			Day    [][]interface{} `json:"day"`
 		} `json:"data"`
 	}
-
-	// 这里需要引入 json 库
-	// 使用 encoding/json
-	// 但为了简化，这里使用标准库的 encoding/json
-	_ = rawData
-
-	key := fmt.Sprintf("%s%s", marketPrefix(code), code)
-
-	// 手动解析 JSON（简化版）
-	var records []KlineRecord
-	klineRaw := extractJSONArray(rawData, key, "qfqday")
-	if len(klineRaw) == 0 {
-		klineRaw = extractJSONArray(rawData, key, "day")
-	}
-	if len(klineRaw) == 0 {
-		// fallback: try without market prefix
-		klineRaw = extractJSONArray(rawData, code, "qfqday")
+	if err := json.Unmarshal([]byte(content), &root); err != nil {
+		return nil, fmt.Errorf("K线 JSON 解析失败: %w", err)
 	}
 
-	for _, item := range klineRaw {
-		switch v := item.(type) {
-		case []interface{}:
-			if len(v) >= 6 {
-				date, _ := v[0].(string)
-				open := toFloat(v[1])
-				close := toFloat(v[2])
-				high := toFloat(v[3])
-				low := toFloat(v[4])
-				volume := toFloat(v[5])
-				records = append(records, KlineRecord{
-					Date:   date,
-					Open:   open,
-					Close:  close,
-					High:   high,
-					Low:    low,
-					Volume: volume,
-				})
-			}
+	node, ok := root.Data[key]
+	if !ok {
+		node, ok = root.Data[code]
+		if !ok {
+			return nil, fmt.Errorf("K线数据未找到 %s", code)
 		}
+	}
+
+	rows := node.QfqDay
+	if len(rows) == 0 {
+		rows = node.Day
+	}
+
+	var records []KlineRecord
+	for _, item := range rows {
+		if len(item) < 6 {
+			continue
+		}
+		date, _ := item[0].(string)
+		records = append(records, KlineRecord{
+			Date:   date,
+			Open:   toFloat(item[1]),
+			Close:  toFloat(item[2]),
+			High:   toFloat(item[3]),
+			Low:    toFloat(item[4]),
+			Volume: toFloat(item[5]),
+		})
 	}
 
 	if len(records) > days {
@@ -480,4 +489,117 @@ func roundTo(v float64, decimals int) float64 {
 	s := fmt.Sprintf(format, v)
 	result, _ := strconv.ParseFloat(s, 64)
 	return result
+}
+
+// ---- 批量 / 名称 / 前复权 ----
+
+// QuoteRecord 批量实时行情单条记录（与 Python /api/batch/quotes 契约一致）
+type QuoteRecord struct {
+	Code        string  `json:"code"`
+	Name        string  `json:"name"`
+	Price       float64 `json:"price"`
+	Open        float64 `json:"open"`
+	PrevClose   float64 `json:"prev_close"`
+	High        float64 `json:"high"`
+	Low         float64 `json:"low"`
+	Volume      float64 `json:"volume"`
+	Amount      float64 `json:"amount"`
+	PriceSource string  `json:"price_source,omitempty"` // ""=实时, "last_close", "close"
+	Stale       bool    `json:"stale"`
+	PriceTS     int64   `json:"price_ts"` // 数据取到时刻（unix 秒）
+}
+
+// MinuteResponse 分钟 K 线（原始 OHLC 棒），供分时检测复用
+type MinuteResponse struct {
+	Code  string        `json:"code"`
+	Count int           `json:"count"`
+	Data  []KlineRecord `json:"data"`
+}
+
+// FetchName 获取股票名称（腾讯 HTTP，复用 realtime 解析）
+func (f *StockFetcher) FetchName(code string) (string, error) {
+	rt, err := f.FetchRealtime(code)
+	if err != nil || rt == nil {
+		return "", fmt.Errorf("获取股票名称失败 [%s]: %w", code, err)
+	}
+	return rt.Name, nil
+}
+
+// FetchBatchQuotes 批量获取实时行情（腾讯 HTTP：一次取多只收盘价/实时价）
+// 返回键为 6 位代码。price_source 默认标 "close"（TDX 优先生效时由调用方覆盖）。
+func (f *StockFetcher) FetchBatchQuotes(codes []string) (map[string]*QuoteRecord, error) {
+	if len(codes) == 0 {
+		return nil, fmt.Errorf("codes 为空")
+	}
+	parts := make([]string, 0, len(codes))
+	for _, c := range codes {
+		parts = append(parts, marketPrefix(c)+c)
+	}
+	url := fmt.Sprintf("http://qt.gtimg.cn/q=%s", strings.Join(parts, ","))
+	body, err := f.httpGet(url)
+	if err != nil {
+		return nil, fmt.Errorf("请求批量行情失败: %w", err)
+	}
+	return f.parseBatchQuotes(body, codes)
+}
+
+func (f *StockFetcher) parseBatchQuotes(content string, codes []string) (map[string]*QuoteRecord, error) {
+	result := make(map[string]*QuoteRecord)
+	now := time.Now().Unix()
+	for _, c := range codes {
+		marker := fmt.Sprintf("v_%s%s=", marketPrefix(c), c)
+		idx := strings.Index(content, marker)
+		if idx < 0 {
+			continue
+		}
+		rest := content[idx+len(marker):]
+		if strings.HasPrefix(rest, "\"") {
+			rest = rest[1:]
+		}
+		end := strings.Index(rest, "\"")
+		if end < 0 {
+			continue
+		}
+		raw := rest[:end]
+		fields := strings.Split(raw, "~")
+		if len(fields) < 40 {
+			continue
+		}
+		name := fields[1]
+		if name == "" {
+			name = c
+		}
+		f.setNameCache(c, name)
+		result[c] = &QuoteRecord{
+			Code:      c,
+			Name:      name,
+			Price:     parseFloatSafe(fields[3]),
+			PrevClose: parseFloatSafe(fields[4]),
+			Open:      parseFloatSafe(fields[5]),
+			High:      parseFloatSafe(fields[33]),
+			Low:       parseFloatSafe(fields[34]),
+			Volume:    parseFloatSafe(fields[6]) * 100,
+			Amount:    parseFloatSafe(fields[37]) * 10000,
+			PriceSource: "close",
+			Stale:    false,
+			PriceTS:  now,
+		}
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("未解析到任何行情")
+	}
+	return result, nil
+}
+
+// FetchQfq 前复权日 K 线（腾讯 HTTP，qfq 参数）。
+// 返回 K线响应、数据源标识、是否未复权兜底、错误。
+func (f *StockFetcher) FetchQfq(code string, days int) (*KlineResponse, string, bool, error) {
+	resp, err := f.FetchKline(code, days)
+	if err != nil {
+		return nil, "", false, err
+	}
+	if resp == nil || resp.Count == 0 {
+		return nil, "", false, fmt.Errorf("前复权K线无数据 [%s]", code)
+	}
+	return resp, "腾讯A股", false, nil
 }

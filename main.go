@@ -31,6 +31,25 @@ func main() {
 	flag.BoolVar(&useTdx, "tdx", getEnvBool("TDX_ENABLED", false), "启用通达信 TCP 数据源（自动测速选最优）")
 	flag.StringVar(&tdxHost, "tdx-host", getEnv("TDX_HOST", ""), "通达信服务器地址（指定后跳过自动测速）")
 	flag.IntVar(&tdxPort, "tdx-port", getEnvInt("TDX_PORT", 7709), "通达信服务器端口，默认 7709")
+
+	// ---- MQTT 接入层（默认关闭）----
+	mqttEnabled := getEnvBool("MQTT_ENABLED", false)
+	mqttBroker := getEnv("MQTT_BROKER", "wss://broker.emqx.io:8084/mqtt")
+	mqttTopic := getEnv("MQTT_TOPIC", "secure/stock-price-mqtt")
+	mqttPassword := getEnv("MQTT_PASSWORD", "stock_price_mqtt_S3cret")
+	mqttClientID := getEnv("MQTT_CLIENT_ID", "")
+	mqttUserSuffix := getEnv("MQTT_USER_SUFFIX", "")
+	mqttPushInterval := getEnvInt("MQTT_PUSH_INTERVAL", 5)
+	mqttPushOnlyTrading := getEnvBool("MQTT_PUSH_ONLY_TRADING", false)
+
+	flag.BoolVar(&mqttEnabled, "mqtt", mqttEnabled, "启用 MQTT 接入层（实时价推送 + 命令响应）")
+	flag.StringVar(&mqttBroker, "mqtt-broker", mqttBroker, "MQTT broker 地址 (wss:// 或 mqtt://)")
+	flag.StringVar(&mqttTopic, "mqtt-topic", mqttTopic, "MQTT 订阅/发布 Topic")
+	flag.StringVar(&mqttPassword, "mqtt-password", mqttPassword, "MQTT 消息 AES 加密密码（须与控制端一致）")
+	flag.StringVar(&mqttClientID, "mqtt-client-id", mqttClientID, "MQTT clientId（默认 ps_+6位hex）")
+	flag.StringVar(&mqttUserSuffix, "mqtt-user-suffix", mqttUserSuffix, "附加在 ping user 字段后的后缀")
+	flag.IntVar(&mqttPushInterval, "mqtt-push-interval", mqttPushInterval, "订阅实时价推送间隔（秒，默认 5）")
+	flag.BoolVar(&mqttPushOnlyTrading, "mqtt-push-only-trading", mqttPushOnlyTrading, "仅交易时段推送实时价")
 	flag.Parse()
 
 	// 日志设置
@@ -70,12 +89,15 @@ func main() {
 		log.Println("配置同步: 已禁用")
 	}
 
+	// 创建实时价格共享缓存
+	quoteCache := NewQuoteCache()
+
 	// 创建服务发现
 	discovery := NewServiceDiscovery(port)
 	discovery.Start()
 
 	// 创建 HTTP 服务
-	handler := NewStockHandler(fetcher, tdxDS, nodeStore, debug)
+	handler := NewStockHandler(fetcher, tdxDS, nodeStore, quoteCache, debug)
 	mux := http.NewServeMux()
 
 	// 注册路由
@@ -84,7 +106,20 @@ func main() {
 	mux.HandleFunc("/api/node/config", handler.HandleNodeConfig)
 	mux.HandleFunc("/api/realtime/", handler.HandleRealtime)
 	mux.HandleFunc("/api/kline/", handler.HandleKline)
+	mux.HandleFunc("/api/qfq/", handler.HandleQfq)
+	mux.HandleFunc("/api/batch/quotes", handler.HandleBatchQuotes)
+	mux.HandleFunc("/api/quote_cache", handler.HandleQuoteCache)
+	mux.HandleFunc("/api/name/", handler.HandleName)
+	mux.HandleFunc("/api/minute/", handler.HandleMinute)
 	mux.HandleFunc("/api/intraday/", handler.HandleIntraday)
+
+	// 创建 MQTT 接入层（可选，默认关闭）
+	var mqttClient *MQTTPriceClient
+	if mqttEnabled {
+		mqttClient = NewMQTTClient(handler, mqttBroker, mqttTopic, mqttPassword,
+			mqttClientID, mqttUserSuffix, mqttPushInterval, mqttPushOnlyTrading)
+		mqttClient.Start()
+	}
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", host, port),
@@ -113,6 +148,11 @@ func main() {
 	log.Println("  - /api/node/config - 节点配置管理 (GET/POST/DELETE)")
 	log.Println("  - /api/realtime/<code> - 实时行情（示例：000001）")
 	log.Println("  - /api/kline/<code>?days=30 - K线数据（示例：000001）")
+	log.Println("  - /api/qfq/<code>?days=30 - 前复权K线（示例：000001，供昨收兜底）")
+	log.Println("  - /api/batch/quotes?codes=000001,600000 - 批量实时行情（一次取多只）")
+	log.Println("  - /api/quote_cache - 实时价格缓存(进程内共享)")
+	log.Println("  - /api/name/<code> - 股票名称（示例：000001）")
+	log.Println("  - /api/minute/<code>?period=7&minutes=300 - 分钟K线（示例：000001）")
 	log.Println("  - /api/intraday/<code>?date=YYYYMMDD - 分时数据（示例：000001）")
 
 	// 优雅退出
@@ -125,6 +165,9 @@ func main() {
 		defer cancel()
 		if tdxDS != nil {
 			tdxDS.Close()
+		}
+		if mqttClient != nil {
+			mqttClient.Stop()
 		}
 		discovery.Stop()
 		server.Shutdown(ctx)

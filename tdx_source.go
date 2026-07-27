@@ -218,4 +218,101 @@ func formatDate(dateStr string) string {
 	return dateStr
 }
 
+// ── 批量 / 分钟 ──────────────────────────────────────────────────────────────
+
+// GetBatchQuotes 通过通达信批量获取实时行情（真实时五档命令）
+// 价格分层兜底：price>0 → 实时价；price=0 但昨收>0 → 昨收；否则跳过（交腾讯兜底）。
+func (ds *TdxDataSource) GetBatchQuotes(codes []string) (map[string]*QuoteRecord, error) {
+	if !ds.Enabled() {
+		return nil, fmt.Errorf("TDX 数据源未连接")
+	}
+	quotes, err := ds.provider.GetQuotesBatch(codes)
+	if err != nil {
+		return nil, fmt.Errorf("TDX 批量行情失败: %w", err)
+	}
+
+	result := make(map[string]*QuoteRecord)
+	now := time.Now().Unix()
+	for _, q := range quotes {
+		rec := &QuoteRecord{
+			Code:      q.Code,
+			Name:      q.Name,
+			Open:      q.Open,
+			High:      q.High,
+			Low:       q.Low,
+			PrevClose: q.LastClose,
+			Volume:    q.Volume,
+			Amount:    q.Amount,
+			PriceTS:   now,
+			Stale:     false,
+		}
+		switch {
+		case q.Price > 0:
+			rec.Price = q.Price
+			rec.PriceSource = "" // 实时价
+		case q.LastClose > 0:
+			rec.Price = q.LastClose
+			rec.PriceSource = "last_close"
+		default:
+			continue // 无价无昨收，交给腾讯兜底
+		}
+		result[q.Code] = rec
+	}
+	return result, nil
+}
+
+// GetMinute 通过通达信获取分钟 K 线（原始 OHLC 棒）
+func (ds *TdxDataSource) GetMinute(code string, period int, minutes int) (*MinuteResponse, error) {
+	if !ds.Enabled() {
+		return nil, fmt.Errorf("TDX 数据源未连接")
+	}
+	market := tdx.ResolveMarket(code)
+	cat, ok := minuteCategory(period)
+	if !ok {
+		cat = tdx.CategoryKLine1Min
+	}
+	if minutes <= 0 {
+		minutes = 300
+	}
+	bars, err := ds.provider.GetKline(uint16(cat), uint16(market), code, 0, uint16(minutes))
+	if err != nil {
+		return nil, fmt.Errorf("TDX 分钟K线失败 [%s]: %w", code, err)
+	}
+	if len(bars) == 0 {
+		return nil, fmt.Errorf("TDX 分钟K线为空 [%s]", code)
+	}
+	records := make([]KlineRecord, 0, len(bars))
+	for _, b := range bars {
+		records = append(records, KlineRecord{
+			Date:   b.Date,
+			Open:   b.Open,
+			Close:  b.Close,
+			High:   b.High,
+			Low:    b.Low,
+			Volume: b.Volume,
+		})
+	}
+	return &MinuteResponse{Code: code, Count: len(records), Data: records}, nil
+}
+
+// minuteCategory 将 mootdx 周期代码映射到 TDX category 常量（pytdx 与 go-tdx 对齐）。
+func minuteCategory(period int) (uint16, bool) {
+	switch period {
+	case 0:
+		return tdx.CategoryKLine5Min, true
+	case 1:
+		return tdx.CategoryKLine15Min, true
+	case 2:
+		return tdx.CategoryKLine30Min, true
+	case 3:
+		return tdx.CategoryKLine1Hour, true
+	case 4:
+		return tdx.CategoryKLineDay, true
+	case 7:
+		return tdx.CategoryKLine1Min, true
+	default:
+		return tdx.CategoryKLine1Min, false
+	}
+}
+
 
