@@ -14,13 +14,14 @@ import (
 )
 
 var (
-	debug       bool
-	host        string
-	port        int
+	debug        bool
+	host         string
+	port         int
 	syncInterval int
-	useTdx      bool
-	tdxHost     string
-	tdxPort     int
+	useTdx       bool
+	tdxHost      string
+	tdxPort      int
+	quoteDBPath  string
 )
 
 func main() {
@@ -31,6 +32,7 @@ func main() {
 	flag.BoolVar(&useTdx, "tdx", getEnvBool("TDX_ENABLED", false), "启用通达信 TCP 数据源（自动测速选最优）")
 	flag.StringVar(&tdxHost, "tdx-host", getEnv("TDX_HOST", ""), "通达信服务器地址（指定后跳过自动测速）")
 	flag.IntVar(&tdxPort, "tdx-port", getEnvInt("TDX_PORT", 7709), "通达信服务器端口，默认 7709")
+	flag.StringVar(&quoteDBPath, "db", getEnv("DB_PATH", "../stock/instockdb.sqlite3"), "SQLite 数据库文件路径（默认共享 stock/instockdb.sqlite3，空=纯内存模式）")
 
 	// ---- MQTT 接入层（默认关闭）----
 	mqttEnabled := getEnvBool("MQTT_ENABLED", false)
@@ -89,8 +91,9 @@ func main() {
 		log.Println("配置同步: 已禁用")
 	}
 
-	// 创建实时价格共享缓存
-	quoteCache := NewQuoteCache()
+	// 创建实时价格共享缓存（内存 + SQLite 落库，对标 Python cn_quote_cache）
+	quoteCache := NewQuoteCache(quoteDBPath)
+	defer quoteCache.Close()
 
 	// 创建服务发现
 	discovery := NewServiceDiscovery(port)
@@ -111,6 +114,7 @@ func main() {
 	mux.HandleFunc("/api/quote_cache", handler.HandleQuoteCache)
 	mux.HandleFunc("/api/name/", handler.HandleName)
 	mux.HandleFunc("/api/minute/", handler.HandleMinute)
+	mux.HandleFunc("/api/valuation/", handler.HandleValuation)
 	mux.HandleFunc("/api/intraday/", handler.HandleIntraday)
 
 	// 创建 MQTT 接入层（可选，默认关闭）
@@ -150,10 +154,11 @@ func main() {
 	log.Println("  - /api/kline/<code>?days=30 - K线数据（示例：000001）")
 	log.Println("  - /api/qfq/<code>?days=30 - 前复权K线（示例：000001，供昨收兜底）")
 	log.Println("  - /api/batch/quotes?codes=000001,600000 - 批量实时行情（一次取多只）")
-	log.Println("  - /api/quote_cache - 实时价格缓存(进程内共享)")
+	log.Println("  - /api/quote_cache - 实时价格缓存(内存+SQLite共享)")
 	log.Println("  - /api/name/<code> - 股票名称（示例：000001）")
 	log.Println("  - /api/minute/<code>?period=7&minutes=300 - 分钟K线（示例：000001）")
 	log.Println("  - /api/intraday/<code>?date=YYYYMMDD - 分时数据（示例：000001）")
+	log.Println("  - /api/valuation/<code>?days=250 - 估值历史（读 cn_stock_spot，示例：600519）")
 
 	// 优雅退出
 	go func() {

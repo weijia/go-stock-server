@@ -146,7 +146,6 @@ func (d *ServiceDiscovery) sendUDPBroadcast() {
 	addr := &net.UDPAddr{IP: net.IPv4(255, 255, 255, 255), Port: discoveryPort}
 	d.udpConn.WriteToUDP(data, addr)
 	d.broadcastCnt++
-	log.Printf("[服务发现-UDP] 广播 #%d → 255.255.255.255:%d", d.broadcastCnt, discoveryPort)
 }
 
 // PrintInfo 打印服务发现信息

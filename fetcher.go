@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -34,9 +35,46 @@ func NewStockFetcher(debug bool) *StockFetcher {
 	}
 }
 
-// marketPrefix 根据股票代码判断市场前缀
+// isHKCode 港股判定：hk 前缀，或 5 位以内纯数字（如 01810 / 09988）。
+// A股/ETF 均为 6 位，不误判；与 Python _is_hk_code 对齐。
+func isHKCode(code string) bool {
+	c := strings.TrimSpace(strings.ToLower(code))
+	if strings.HasPrefix(c, "hk") {
+		return true
+	}
+	if c == "" {
+		return false
+	}
+	for _, r := range c {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return len(c) <= 5
+}
+
+// apiCode 返回腾讯接口使用的代码：港股去掉 hk 前缀并补零到 5 位（如 hk00700 -> 00700），
+// 其余原样返回。
+func apiCode(code string) string {
+	c := strings.TrimSpace(code)
+	if !isHKCode(c) {
+		return c
+	}
+	c = strings.ToLower(c)
+	c = strings.TrimPrefix(c, "hk")
+	c = strings.TrimSpace(c)
+	for len(c) < 5 {
+		c = "0" + c
+	}
+	return c
+}
+
+// marketPrefix 根据股票代码判断市场前缀（腾讯接口用：sh / sz / hk）
 func marketPrefix(code string) string {
 	code = strings.TrimSpace(code)
+	if isHKCode(code) {
+		return "hk"
+	}
 	if strings.HasPrefix(code, "6") || strings.HasPrefix(code, "5") ||
 		strings.HasPrefix(code, "9") {
 		return "sh"
@@ -47,7 +85,8 @@ func marketPrefix(code string) string {
 // FetchRealtime 获取实时行情
 func (f *StockFetcher) FetchRealtime(code string) (*RealtimeData, error) {
 	prefix := marketPrefix(code)
-	url := fmt.Sprintf("http://qt.gtimg.cn/q=%s%s", prefix, code)
+	sym := apiCode(code)
+	url := fmt.Sprintf("http://qt.gtimg.cn/q=%s%s", prefix, sym)
 
 	body, err := f.httpGet(url)
 	if err != nil {
@@ -59,8 +98,14 @@ func (f *StockFetcher) FetchRealtime(code string) (*RealtimeData, error) {
 
 // FetchKline 获取K线数据
 func (f *StockFetcher) FetchKline(code string, days int) (*KlineResponse, error) {
+	// 港股：腾讯 fqkline 接口不提供前复权历史（无 qfqday 字段），
+	// 与 Python _qfq_from_hk_tencent 一致改走当日快照构造 1 行未复权数据。
+	if isHKCode(code) {
+		return f.fetchHKKline(code)
+	}
 	prefix := marketPrefix(code)
-	url := fmt.Sprintf("http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s%s,day,,,%d,qfq", prefix, code, days)
+	sym := apiCode(code)
+	url := fmt.Sprintf("http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s%s,day,,,%d,qfq", prefix, sym, days)
 
 	body, err := f.httpGet(url)
 	if err != nil {
@@ -70,11 +115,78 @@ func (f *StockFetcher) FetchKline(code string, days int) (*KlineResponse, error)
 	return f.parseKline(body, code, days)
 }
 
+// fetchHKKline 港股 K 线：腾讯当日快照（qt.gtimg.cn/q=hkXXXXX）构造 1 行未复权数据。
+// 与 Python _qfq_from_hk_tencent 对齐：date=今天，open=vals[5]，close=vals[3]，
+// high/low 字段充足时取 vals[33]/[34]，否则用 open/close 边界近似；volume 取股数不 ×100。
+func (f *StockFetcher) fetchHKKline(code string) (*KlineResponse, error) {
+	sym := apiCode(code)
+	url := fmt.Sprintf("http://qt.gtimg.cn/q=hk%s", sym)
+
+	body, err := f.httpGet(url)
+	if err != nil {
+		return nil, fmt.Errorf("请求港股快照失败: %w", err)
+	}
+
+	key := fmt.Sprintf("v_hk%s=", sym)
+	idx := strings.Index(body, key)
+	if idx < 0 {
+		return nil, fmt.Errorf("未找到港股 %s 数据", code)
+	}
+	start := idx + len(key) + 1
+	end := strings.Index(body[start:], "\"")
+	if end < 0 {
+		return nil, fmt.Errorf("解析响应格式失败")
+	}
+	vals := strings.Split(body[start:start+end], "~")
+	if len(vals) < 6 {
+		return nil, fmt.Errorf("腾讯返回字段不足(%d)", len(vals))
+	}
+
+	price := parseFloatSafe(vals[3])
+	if price <= 0 {
+		return nil, fmt.Errorf("腾讯返回价格为0(停牌/无数据)")
+	}
+	open := parseFloatSafe(vals[5])
+	var high, low, vol float64
+	if len(vals) > 34 {
+		high = parseFloatSafe(vals[33])
+		low = parseFloatSafe(vals[34])
+		vol = parseFloatSafe(vals[36])
+	} else {
+		high = math.Max(open, price)
+		low = math.Min(open, price)
+		vol = parseFloatSafe(vals[6])
+	}
+
+	name := vals[1]
+	if name == "" {
+		name = code
+	}
+	f.setNameCache(code, name)
+
+	records := []KlineRecord{{
+		Date:   time.Now().Format("2006-01-02"),
+		Open:   open,
+		Close:  price,
+		High:   high,
+		Low:    low,
+		Volume: vol,
+	}}
+
+	return &KlineResponse{
+		Code:  code,
+		Name:  f.getNameCache(code),
+		Count: len(records),
+		Data:  records,
+	}, nil
+}
+
 // FetchIntraday 获取分时数据
 func (f *StockFetcher) FetchIntraday(code string, date string) (*IntradayResponse, error) {
 	// 使用腾讯分时 API
 	prefix := marketPrefix(code)
-	url := fmt.Sprintf("http://ifzq.gtimg.cn/appstock/app/minute/query?_var=min_data&code=%s%s", prefix, code)
+	sym := apiCode(code)
+	url := fmt.Sprintf("http://ifzq.gtimg.cn/appstock/app/minute/query?_var=min_data&code=%s%s", prefix, sym)
 
 	body, err := f.httpGet(url)
 	if err != nil {
@@ -98,7 +210,16 @@ func (f *StockFetcher) httpGet(url string) (string, error) {
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return "", err
+		// 瞬时网络错误（DNS 解析失败 / 连接被拒等）自动重试一次，
+		// 避免上游域名短暂抖动时整个请求直接失败。
+		time.Sleep(400 * time.Millisecond)
+		if f.debug {
+			log.Printf("[HTTP] 重试 %s (首次失败: %v)", url, err)
+		}
+		resp, err = f.client.Do(req)
+		if err != nil {
+			return "", err
+		}
 	}
 	defer resp.Body.Close()
 
@@ -126,7 +247,7 @@ func gbkToUtf8(b []byte) string {
 
 // parseRealtime 解析实时行情
 func (f *StockFetcher) parseRealtime(content, code string) (*RealtimeData, error) {
-	key := fmt.Sprintf("v_%s%s=", marketPrefix(code), code)
+	key := fmt.Sprintf("v_%s%s=", marketPrefix(code), apiCode(code))
 
 	idx := strings.Index(content, key)
 	if idx < 0 {
@@ -150,6 +271,13 @@ func (f *StockFetcher) parseRealtime(content, code string) (*RealtimeData, error
 	}
 	f.setNameCache(code, name)
 
+	volume := parseFloatSafe(parts[6])
+	amount := parseFloatSafe(parts[37])
+	if !isHKCode(code) {
+		volume *= 100    // 手转股
+		amount *= 10000  // 万元转元
+	}
+
 	return &RealtimeData{
 		Name:      name,
 		Code:      code,
@@ -158,8 +286,8 @@ func (f *StockFetcher) parseRealtime(content, code string) (*RealtimeData, error
 		Open:      parseFloatSafe(parts[5]),
 		High:      parseFloatSafe(parts[33]),
 		Low:       parseFloatSafe(parts[34]),
-		Volume:    parseFloatSafe(parts[6]) * 100,        // 手转股
-		Amount:    parseFloatSafe(parts[37]) * 10000,     // 万元转元
+		Volume:    volume,
+		Amount:    amount,
 		ChangeAmt: parseFloatSafe(parts[31]),
 		ChangePct: parseFloatSafe(parts[32]),
 	}, nil
@@ -167,7 +295,7 @@ func (f *StockFetcher) parseRealtime(content, code string) (*RealtimeData, error
 
 // parseKline 解析 K 线数据（标准 JSON 解码，覆盖 qfqday / day 两种字段）
 func (f *StockFetcher) parseKline(content, code string, days int) (*KlineResponse, error) {
-	key := fmt.Sprintf("%s%s", marketPrefix(code), code)
+	key := fmt.Sprintf("%s%s", marketPrefix(code), apiCode(code))
 
 	var root struct {
 		Code int `json:"code"`
@@ -304,7 +432,7 @@ func parseArrayElement(s string) interface{} {
 
 // parseIntraday 解析分时数据
 func (f *StockFetcher) parseIntraday(content, code, date string) (*IntradayResponse, error) {
-	key := fmt.Sprintf("%s%s", marketPrefix(code), code)
+	key := fmt.Sprintf("%s%s", marketPrefix(code), apiCode(code))
 
 	// 腾讯分时 API 返回 JavaScript 变量赋值
 	// 提取 data 部分
@@ -533,7 +661,7 @@ func (f *StockFetcher) FetchBatchQuotes(codes []string) (map[string]*QuoteRecord
 	}
 	parts := make([]string, 0, len(codes))
 	for _, c := range codes {
-		parts = append(parts, marketPrefix(c)+c)
+		parts = append(parts, marketPrefix(c)+apiCode(c))
 	}
 	url := fmt.Sprintf("http://qt.gtimg.cn/q=%s", strings.Join(parts, ","))
 	body, err := f.httpGet(url)
@@ -547,7 +675,7 @@ func (f *StockFetcher) parseBatchQuotes(content string, codes []string) (map[str
 	result := make(map[string]*QuoteRecord)
 	now := time.Now().Unix()
 	for _, c := range codes {
-		marker := fmt.Sprintf("v_%s%s=", marketPrefix(c), c)
+		marker := fmt.Sprintf("v_%s%s=", marketPrefix(c), apiCode(c))
 		idx := strings.Index(content, marker)
 		if idx < 0 {
 			continue
@@ -570,6 +698,12 @@ func (f *StockFetcher) parseBatchQuotes(content string, codes []string) (map[str
 			name = c
 		}
 		f.setNameCache(c, name)
+		vol := parseFloatSafe(fields[6])
+		amt := parseFloatSafe(fields[37])
+		if !isHKCode(c) {
+			vol *= 100    // 手转股
+			amt *= 10000  // 万元转元
+		}
 		result[c] = &QuoteRecord{
 			Code:      c,
 			Name:      name,
@@ -578,8 +712,8 @@ func (f *StockFetcher) parseBatchQuotes(content string, codes []string) (map[str
 			Open:      parseFloatSafe(fields[5]),
 			High:      parseFloatSafe(fields[33]),
 			Low:       parseFloatSafe(fields[34]),
-			Volume:    parseFloatSafe(fields[6]) * 100,
-			Amount:    parseFloatSafe(fields[37]) * 10000,
+			Volume:    vol,
+			Amount:    amt,
 			PriceSource: "close",
 			Stale:    false,
 			PriceTS:  now,
@@ -594,6 +728,10 @@ func (f *StockFetcher) parseBatchQuotes(content string, codes []string) (map[str
 // FetchQfq 前复权日 K 线（腾讯 HTTP，qfq 参数）。
 // 返回 K线响应、数据源标识、是否未复权兜底、错误。
 func (f *StockFetcher) FetchQfq(code string, days int) (*KlineResponse, string, bool, error) {
+	source := "腾讯A股"
+	if isHKCode(code) {
+		source = "腾讯HTTP(港股快照)"
+	}
 	resp, err := f.FetchKline(code, days)
 	if err != nil {
 		return nil, "", false, err
@@ -601,5 +739,5 @@ func (f *StockFetcher) FetchQfq(code string, days int) (*KlineResponse, string, 
 	if resp == nil || resp.Count == 0 {
 		return nil, "", false, fmt.Errorf("前复权K线无数据 [%s]", code)
 	}
-	return resp, "腾讯A股", false, nil
+	return resp, source, false, nil
 }

@@ -548,7 +548,33 @@ func (h *StockHandler) HandleQfq(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	stale := false
 	resp, source, unadjusted, err := h.fetcher.FetchQfq(code, days)
+	if err != nil || resp == nil || resp.Count == 0 {
+		// 腾讯 HTTP 失败 → TDX 未复权日 K 兜底（对齐 Python 主链第三层：
+		// 网络源失败 → 本地 TDX 前复权 → 未复权兜底并标记 unadjusted）。
+		if h.tdx != nil && h.tdx.Enabled() {
+			if tdxResp, tdxErr := h.tdx.GetKline(code, days); tdxErr == nil && tdxResp != nil && tdxResp.Count > 0 {
+				log.Printf("[QFQ] 腾讯HTTP失败(%v)，TDX 未复权兜底 [%s]", err, code)
+				resp = tdxResp
+				source = "通达信TCP(未复权)"
+				unadjusted = true
+				err = nil
+			}
+		}
+	}
+	if err != nil || resp == nil || resp.Count == 0 {
+		// 腾讯 + TDX 均不可用 → 读共享库 cn_stock_hist 前复权日 K 兜底
+		// （对齐 Python 读库策略：数据可能非最新交易日，标记 stale）。
+		if dbResp := h.fetchHistFromDB(code, days); dbResp != nil && dbResp.Count > 0 {
+			log.Printf("[QFQ] 实时源均失败，DB cn_stock_hist 兜底 [%s]", code)
+			resp = dbResp
+			source = "DB历史(前复权)"
+			unadjusted = false
+			stale = true
+			err = nil
+		}
+	}
 	if err != nil || resp == nil || resp.Count == 0 {
 		h.sendJSON(w, 503, map[string]interface{}{
 			"code":    503,
@@ -569,7 +595,7 @@ func (h *StockHandler) HandleQfq(w http.ResponseWriter, r *http.Request) {
 			"name":       resp.Name,
 			"count":      resp.Count,
 			"data":       resp.Data,
-			"stale":      false,
+			"stale":      stale,
 			"price_ts":   now.Format(time.RFC3339),
 			"source":     source,
 			"unadjusted": unadjusted,
@@ -577,6 +603,54 @@ func (h *StockHandler) HandleQfq(w http.ResponseWriter, r *http.Request) {
 		"timestamp": now.Format(time.RFC3339),
 	})
 	h.logResponse(200, start)
+}
+
+// fetchHistFromDB 读共享 SQLite 库 cn_stock_hist 前复权日 K 兜底
+// （与 Python 版读库策略对齐；数据可能非最新交易日，由调用方标记 stale）。
+func (h *StockHandler) fetchHistFromDB(code string, days int) *KlineResponse {
+	db := h.quoteCache.DB()
+	if db == nil {
+		return nil
+	}
+	rows, err := db.Query(
+		`SELECT date, open, close, high, low, volume
+		   FROM cn_stock_hist WHERE code = ? ORDER BY date DESC LIMIT ?`,
+		code, days)
+	if err != nil {
+		if h.debug {
+			log.Printf("[QFQ] cn_stock_hist 查询失败: %v", err)
+		}
+		return nil
+	}
+	defer rows.Close()
+
+	records := make([]KlineRecord, 0, days)
+	for rows.Next() {
+		var rec KlineRecord
+		if err := rows.Scan(&rec.Date, &rec.Open, &rec.Close, &rec.High, &rec.Low, &rec.Volume); err != nil {
+			if h.debug {
+				log.Printf("[QFQ] cn_stock_hist 行解析失败: %v", err)
+			}
+			return nil
+		}
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	// 查询为 date DESC，反转为升序（与实时源返回一致，末根为最新）
+	for i, j := 0, len(records)-1; i < j; i, j = i+1, j-1 {
+		records[i], records[j] = records[j], records[i]
+	}
+	return &KlineResponse{
+		Code:  code,
+		Name:  h.fetcher.getNameCache(code),
+		Count: len(records),
+		Data:  records,
+	}
 }
 
 // ensureTodayOpen 若 qfq 末根不是今天，则用 TDX 未复权当日日线补一根（前复权锚定最新交易日，无跳变）
