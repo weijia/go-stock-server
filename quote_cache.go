@@ -121,7 +121,10 @@ func normalizeCode(code string) string {
 	return code
 }
 
-// ensureTable 确保 cn_quote_cache 表存在（结构与 Python 版 quote_cache.py 完全一致）
+// ensureTable 确保 cn_quote_cache 表存在且 code 列为主键（结构与 Python 版 quote_cache.py 完全一致）。
+// 旧版本遗留的表可能没有主键（code 无 PRIMARY KEY/UNIQUE），
+// 会触发 SQLite 的 "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"，
+// 这里通过探测 upsert 语句能否 Prepare 来发现并自动迁移重建（保留已有数据）。
 func (c *QuoteCache) ensureTable() error {
 	ddl := `CREATE TABLE IF NOT EXISTS cn_quote_cache (
     code        VARCHAR(16) PRIMARY KEY,
@@ -134,8 +137,59 @@ func (c *QuoteCache) ensureTable() error {
     price_ts    BIGINT,
     updated_at  BIGINT
 )`
-	_, err := c.db.Exec(ddl)
-	return err
+	if _, err := c.db.Exec(ddl); err != nil {
+		return err
+	}
+	// 探测：表结构不合法（code 无主键/唯一约束）时，Prepare 直接报错
+	probe, err := c.db.Prepare(`INSERT INTO cn_quote_cache
+	(code,name,price,open,prev_close,high,low,price_ts,updated_at)
+	VALUES (?,?,?,?,?,?,?,?,?)
+	ON CONFLICT(code) DO UPDATE SET name=excluded.name`)
+	if err != nil {
+		return c.migrateTable()
+	}
+	probe.Close()
+	return nil
+}
+
+// migrateTable 重建 cn_quote_cache 表：旧表 code 无主键，无法使用 ON CONFLICT(code)，
+// 先复制数据到带主键的新表再切换（缓存表，数据可随时由行情源恢复）。
+func (c *QuoteCache) migrateTable() error {
+	log.Printf("[QuoteCache] cn_quote_cache 缺少主键，重建表结构（保留已有数据）")
+	tx, err := c.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	steps := []string{
+		`CREATE TABLE IF NOT EXISTS cn_quote_cache_new (
+    code        VARCHAR(16) PRIMARY KEY,
+    name        VARCHAR(64),
+    price       FLOAT,
+    open        FLOAT,
+    prev_close  FLOAT,
+    high        FLOAT,
+    low         FLOAT,
+    price_ts    BIGINT,
+    updated_at  BIGINT
+)`,
+		`INSERT OR IGNORE INTO cn_quote_cache_new
+	(code,name,price,open,prev_close,high,low,price_ts,updated_at)
+	SELECT code,name,price,open,prev_close,high,low,price_ts,updated_at
+	FROM cn_quote_cache`,
+		`DROP TABLE cn_quote_cache`,
+		`ALTER TABLE cn_quote_cache_new RENAME TO cn_quote_cache`,
+	}
+	for _, s := range steps {
+		if _, err := tx.Exec(s); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	log.Printf("[QuoteCache] cn_quote_cache 表结构已重建（主键 code）")
+	return nil
 }
 
 // UpsertMany 批量写入（来自批量行情结果）：先更新内存，再落库
