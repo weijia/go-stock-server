@@ -135,7 +135,7 @@ func main() {
 
 	// 打印启动信息
 	localIP := getLocalIP()
-	log.Println("股票行情服务器启动 (Go 版)")
+	log.Printf("股票行情服务器启动 (Go 版) v%s", serverVersion)
 	log.Printf("  本机 IP: %s\n", localIP)
 	log.Printf("  HTTP 端口: %d\n", port)
 	log.Printf("  访问地址: http://%s:%d\n", localIP, port)

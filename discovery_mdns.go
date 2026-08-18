@@ -110,7 +110,7 @@ func (d *ServiceDiscovery) mdnsRespondLoop() {
 			continue
 		}
 
-		resp := d.buildMDNSResponse(&msg)
+		resp := d.buildMDNSResponse(&msg, src.IP)
 		if resp == nil {
 			continue
 		}
@@ -121,7 +121,7 @@ func (d *ServiceDiscovery) mdnsRespondLoop() {
 			log.Printf("[服务发现-mDNS] 发送失败: %v", err)
 		} else {
 			d.queryCnt++
-			log.Printf("[服务发现-mDNS] 响应查询 #%d (%s)", d.queryCnt, src.IP)
+			log.Printf("[服务发现-mDNS] 响应查询 #%d (%s) -> 应答IP %s", d.queryCnt, src.IP, d.localIPForSubnet(src.IP))
 		}
 	}
 }
@@ -200,12 +200,15 @@ func (d *ServiceDiscovery) sendMDNSAnnouncement() {
 }
 
 // buildMDNSResponse 构建查询响应
-func (d *ServiceDiscovery) buildMDNSResponse(query *dns.Msg) *dns.Msg {
+func (d *ServiceDiscovery) buildMDNSResponse(query *dns.Msg, srcIP net.IP) *dns.Msg {
 	resp := &dns.Msg{}
 	resp.Response = true
 	resp.Authoritative = true
 	resp.RecursionAvailable = false
 	resp.SetReply(query)
+
+	// 按查询来源网段选出本机应答 IP（多网卡/跨网段时返回可直达的地址，而非默认出口 IP）
+	answerIP := d.localIPForSubnet(srcIP)
 
 	matched := false
 	for _, q := range query.Question {
@@ -228,7 +231,7 @@ func (d *ServiceDiscovery) buildMDNSResponse(query *dns.Msg) *dns.Msg {
 				})
 				resp.Extra = append(resp.Extra, &dns.A{
 					Hdr: dns.RR_Header{Name: d.instanceName + ".local.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120},
-					A:   d.localIP,
+					A:   answerIP,
 				})
 				matched = true
 			}
@@ -236,7 +239,7 @@ func (d *ServiceDiscovery) buildMDNSResponse(query *dns.Msg) *dns.Msg {
 			if name == d.instanceName+".local." {
 				resp.Answer = append(resp.Answer, &dns.A{
 					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120},
-					A:   d.localIP,
+					A:   answerIP,
 				})
 				matched = true
 			}

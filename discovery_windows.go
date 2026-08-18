@@ -16,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
@@ -152,7 +153,7 @@ func (d *ServiceDiscovery) mdnsRespondLoop() {
 			continue
 		}
 
-		resp := d.buildMDNSResponse(&msg)
+		resp := d.buildMDNSResponse(&msg, src.IP)
 		if resp == nil {
 			continue
 		}
@@ -175,7 +176,7 @@ func (d *ServiceDiscovery) mdnsRespondLoop() {
 			}
 		}
 		d.queryCnt++
-		log.Printf("[服务发现-mDNS] 响应查询 #%d (%s)", d.queryCnt, src.IP)
+		log.Printf("[服务发现-mDNS] 响应查询 #%d (%s) -> 应答IP %s", d.queryCnt, src.IP, d.localIPForSubnet(src.IP))
 	}
 }
 
@@ -251,12 +252,15 @@ func (d *ServiceDiscovery) sendMDNSAnnouncement() {
 // 支持 PTR/SRV/TXT/A/ANY 查询；对每个匹配的查询返回完整记录集
 // （PTR 响应附带 SRV/TXT，SRV/TXT 响应附带 A），保证 zeroconf 等客户端
 // 一次查询即可拿到全部信息，无需二次查询。
-func (d *ServiceDiscovery) buildMDNSResponse(query *dns.Msg) *dns.Msg {
+func (d *ServiceDiscovery) buildMDNSResponse(query *dns.Msg, srcIP net.IP) *dns.Msg {
 	resp := &dns.Msg{}
 	resp.Response = true
 	resp.Authoritative = true
 	resp.RecursionAvailable = false
 	resp.SetReply(query)
+
+	// 按查询来源网段选出本机应答 IP（多网卡/跨网段时返回可直达的地址，而非默认出口 IP）
+	answerIP := d.localIPForSubnet(srcIP)
 
 	fqdn := strings.ToLower(d.fqdn + ".")
 	svcType := strings.ToLower(mdnsServiceType + ".local.")
@@ -281,7 +285,7 @@ func (d *ServiceDiscovery) buildMDNSResponse(query *dns.Msg) *dns.Msg {
 	}
 	a := &dns.A{
 		Hdr: dns.RR_Header{Name: host, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120},
-		A:   d.localIP,
+		A:   answerIP,
 	}
 
 	matched := false
@@ -331,4 +335,44 @@ func (d *ServiceDiscovery) buildMDNSResponse(query *dns.Msg) *dns.Msg {
 	// 附上 SRV Target 的 A 记录（RFC 6762 Additional Records，避免二次查询）
 	resp.Extra = append(resp.Extra, a)
 	return resp
+}
+
+// watchIPChange Windows 平台：通过 iphlpapi.NotifyIpInterfaceChange 注册回调，
+// 本机任意 IP 接口变化（获分配址/失效）即时触发，无需轮询。
+func (d *ServiceDiscovery) watchIPChange() {
+	iphlpapi := windows.NewLazySystemDLL("iphlpapi.dll")
+	notifyProc := iphlpapi.NewProc("NotifyIpInterfaceChange")
+	cancelProc := iphlpapi.NewProc("CancelMibChangeNotify2")
+
+	// 回调：IP 接口变化即重新探测主 IPv4 并交给 onIPChanged
+	callback := func(callerContext uintptr, row uintptr, notificationType uint32) uintptr {
+		d.onIPChanged(d.findLocalIPv4())
+		return 0
+	}
+	cb := windows.NewCallback(callback)
+
+	var handle windows.Handle
+	// Family=AF_UNSPEC(0) 监听 IPv4+IPv6；InitialNotification=FALSE(0)
+	rc, _, err := notifyProc.Call(
+		0, // AF_UNSPEC
+		cb,
+		0, // CallerContext
+		0, // InitialNotification = FALSE
+		uintptr(unsafe.Pointer(&handle)),
+	)
+	if rc != 0 {
+		log.Printf("[服务发现] 注册 IP 变化监听失败: %v", err)
+		return
+	}
+	d.ipNotifyCancel = func() {
+		cancelProc.Call(uintptr(handle))
+	}
+	defer func() {
+		d.ipNotifyCancel = nil
+	}()
+
+	log.Println("[服务发现] 已注册 Windows IP 变化监听（NotifyIpInterfaceChange）")
+
+	// 阻塞等待退出信号；回调在独立线程触发，这里只负责在 Stop 时收尾
+	<-d.mdnsStop
 }
