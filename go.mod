@@ -57,4 +57,4 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-replace github.com/weijia/go-tdx => ../go-tdx
+replace github.com/weijia/go-tdx v0.1.0 => ../go-tdx

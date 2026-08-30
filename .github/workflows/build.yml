@@ -9,12 +9,12 @@ on:
   workflow_dispatch:
     inputs:
       skip_apk_gui:
-        description: "跳过方案 C Fyne APK（慢，约 12 分钟）"
+        description: "跳过方案 C Fyne APK（慢，约 25 分钟）"
         required: false
         type: boolean
         default: false
       skip_apk_shell:
-        description: "跳过方案 B Shell APK（约 8 分钟）"
+        description: "跳过方案 B Shell APK（约 10 分钟）"
         required: false
         type: boolean
         default: false
@@ -24,24 +24,35 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION:   "1.25"       # go.mod 里已用的大版本
-  JDK_VERSION:  "17"         # AGP 8.4 需要 JDK 17
+  GO_VERSION:   "1.25"
+  JDK_VERSION:  "17"
   ANDROID_COMPILE_SDK: "34"
   ANDROID_BUILD_TOOLS: "34.0.0"
   ANDROID_NDK_VERSION: "26.3.11579264"
   GOPROXY: "https://proxy.golang.org,direct"
+  # go-tdx 固定 commit（沙箱本地用 replace ../go-tdx，CI 上 clone 到 ../go-tdx 同 commit）
+  GO_TDX_COMMIT: "a9f773c55cf7279d047d8d1ad35b83d2970869ec"
 
 jobs:
 
   ###########################################################################
-  # Job 1 — 方案 A CLI 三平台 + go vet + HTTP smoke 门禁
+  # CLI (方案 A) + vet + smoke
   ###########################################################################
   cli:
     name: "CLI (方案A) + vet + smoke"
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout go-tdx dependency (replace => ../go-tdx)
+        run: |
+          set -e
+          cd ..
+          git clone --depth 50 https://github.com/weijia/go-tdx.git go-tdx
+          cd go-tdx
+          git checkout --quiet "$GO_TDX_COMMIT"
+          ls go.mod
 
       - name: Setup Go ${{ env.GO_VERSION }}
         uses: actions/setup-go@v5
@@ -51,11 +62,10 @@ jobs:
 
       - name: Go mod download & vet (non-GUI packages)
         run: |
-          set -e
+          set -euo pipefail
           go mod download
-          # 只 vet 非 Fyne 包（否则触发 CGO OpenGL 缺库）
-          LIST=$(go list ./... | grep -v -E "cmd/android-gui")
-          CGO_ENABLED=0 go vet $LIST
+          mapfile -t LIST < <(go list ./... | grep -v -E "cmd/android-gui")
+          CGO_ENABLED=0 go vet "${LIST[@]}"
 
       - name: Build CLI binaries (方案A)
         run: |
@@ -73,23 +83,23 @@ jobs:
           /tmp/srv --db "" --host 127.0.0.1 --port 29700 > /tmp/srv.log 2>&1 & PID=$!
           sleep 3
           OUT=/tmp/snap.txt
-          : > $OUT
+          : > "$OUT"
           for t in "T1 /api/health" "T2 /api/config" "T3 /api/quote_cache"; do
             name=${t% *}; url=${t#* }
-            echo "=== $name ===" >> $OUT
+            echo "=== $name ===" >> "$OUT"
             curl -s --max-time 5 "http://127.0.0.1:29700$url" \
-              | sed -E "s/\"timestamp\":\"[^\"]*\"/\"ts\":\"__\"/g; s/\"uptime_seconds\":[0-9]+/\"up\":0/g; s/\"start_time\":\"[^\"]*\"/\"st\":\"__\"/g" \
-              >> $OUT; echo "" >> $OUT
+              | sed -E 's/"timestamp":"[^"]*"/"ts":"__"/g; s/"uptime_seconds":[0-9]+/"up":0/g; s/"start_time":"[^"]*"/"st":"__"/g' \
+              >> "$OUT"; echo "" >> "$OUT"
           done
-          echo "=== T4 ===" >> $OUT
+          echo "=== T4 ===" >> "$OUT"
           curl -s --max-time 5 -w "\nHTTP_STATUS:%{http_code}" \
             "http://127.0.0.1:29700/api/node/config" \
-            | sed -E "s/\"timestamp\":\"[^\"]*\"/\"ts\":\"__\"/g" >> $OUT
-          kill -SIGTERM $PID 2>/dev/null; wait $PID 2>/dev/null || true
-          cat $OUT
+            | sed -E 's/"timestamp":"[^"]*"/"ts":"__"/g' >> "$OUT"
+          kill -SIGTERM "$PID" 2>/dev/null; wait "$PID" 2>/dev/null || true
+          cat "$OUT"
           set +e
-          grep -q "HTTP_STATUS:400" $OUT          && echo "✅ T4 400 X-Node-ID 正确"
-          grep -q "\"code\":200" $OUT              && echo "✅ T1~T3 200 OK"
+          grep -q "HTTP_STATUS:400" "$OUT"          && echo "✅ T4 400 X-Node-ID correct"
+          grep -q "\"code\":200" "$OUT"              && echo "✅ T1~T3 200 OK"
 
       - name: Upload CLI artifacts
         uses: actions/upload-artifact@v4
@@ -99,16 +109,24 @@ jobs:
           retention-days: 30
 
   ###########################################################################
-  # Job 2 — 方案 B Shell APK
+  # Shell APK (方案 B)
   ###########################################################################
   apk_shell:
     name: "Shell APK (方案B)"
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     if: ${{ !inputs.skip_apk_shell }}
     needs: cli
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout go-tdx dependency (replace => ../go-tdx)
+        run: |
+          set -e
+          cd ..
+          git clone --depth 50 https://github.com/weijia/go-tdx.git go-tdx
+          cd go-tdx
+          git checkout --quiet "$GO_TDX_COMMIT"
 
       - name: Setup Go ${{ env.GO_VERSION }}
         uses: actions/setup-go@v5
@@ -131,7 +149,7 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          cmdline-tools-version: 11076708   # cmdline-tools 12 (2024)
+          cmdline-tools-version: 11076708
           packages: >-
             platforms;android-${{ env.ANDROID_COMPILE_SDK }}
             build-tools;${{ env.ANDROID_BUILD_TOOLS }}
@@ -153,7 +171,6 @@ jobs:
         working-directory: android-app
         run: |
           set -e
-          # 优先 wrapper，否则用 setup-gradle 装的 gradle
           CMD="gradle"
           [ -x ./gradlew ] && CMD="./gradlew"
           $CMD --no-daemon --no-watch-fs --warning-mode all app:assembleDebug 2>&1 | tail -60
@@ -172,16 +189,24 @@ jobs:
           retention-days: 90
 
   ###########################################################################
-  # Job 3 — 方案 C Fyne GUI APK
+  # Fyne GUI APK (方案 C)
   ###########################################################################
   apk_gui:
     name: "Fyne GUI APK (方案C)"
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     if: ${{ !inputs.skip_apk_gui }}
     needs: cli
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout go-tdx dependency (replace => ../go-tdx)
+        run: |
+          set -e
+          cd ..
+          git clone --depth 50 https://github.com/weijia/go-tdx.git go-tdx
+          cd go-tdx
+          git checkout --quiet "$GO_TDX_COMMIT"
 
       - name: Setup Go ${{ env.GO_VERSION }}
         uses: actions/setup-go@v5
@@ -200,18 +225,18 @@ jobs:
         with:
           cmdline-tools-version: 11076708
           packages: >-
-            platforms;android-34
+            platforms;android-${{ env.ANDROID_COMPILE_SDK }}
             build-tools;${{ env.ANDROID_BUILD_TOOLS }}
             ndk;${{ env.ANDROID_NDK_VERSION }}
 
       - name: Install Fyne CLI
         run: |
-          GOBIN=/usr/local/bin go install fyne.io/fyne/v2/cmd/fyne@v2.8.1
+          GOPROXY=https://proxy.golang.org,direct GOBIN=/usr/local/bin \
+            go install fyne.io/fyne/v2/cmd/fyne@v2.8.1
           fyne version
 
       - name: Generate GUI icon
         run: |
-          # 生成 512x512 PNG（蓝色渐变占位）；项目自己有 icon 后可替换
           mkdir -p build-out
           cat > /tmp/genicon.go <<'GO'
           package main
@@ -231,22 +256,23 @@ jobs:
           }
           GO
           go run /tmp/genicon.go build-out/gui_icon.png
+          ls -lh build-out/gui_icon.png
 
-      - name: Ensure gui_main.go in module root (for `fyne package .`)
+      - name: Ensure gui_main.go in module root
         run: |
+          set -e
           [ -f gui_main.go ] || cp cmd/android-gui/main.go gui_main.go
-          # 给 gui_main.go 加 android-only build tag，避免 go vet 把 Linux CGO 编进去
           head -1 gui_main.go | grep -q "^//go:build" || \
             sed -i '1i //go:build android || ignore_gui_main' gui_main.go
+          head -4 gui_main.go
 
       - name: Fyne package -os android
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
         run: |
           set -e
-          export ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION
-          [ -d "$ANDROID_NDK_HOME" ] || { echo "NDK 不存在"; ls $ANDROID_SDK_ROOT/ndk/; exit 1; }
-          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          export ANDROID_NDK_HOME="${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/$ANDROID_NDK_VERSION"
+          [ -d "$ANDROID_NDK_HOME" ] || { echo "NDK 不存在，可用的 NDK:"; ls "$ANDROID_SDK_ROOT/ndk/"; exit 1; }
           unset CGO_ENABLED
           fyne package -os android \
             -appID com.stock.server.gui \
@@ -265,10 +291,10 @@ jobs:
           retention-days: 90
 
   ###########################################################################
-  # Job 4 — 汇总发布（仅 tag）
+  # Release (仅 tag v*)
   ###########################################################################
   release:
-    name: "GitHub Release（仅 push tag v*）"
+    name: "GitHub Release（仅 tag v*）"
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -281,8 +307,9 @@ jobs:
         run: |
           mkdir -p release
           find release-artifacts -type f -exec cp {} release/ \;
-          cd release && sha256sum * > SHA256SUMS.txt
-          ls -lh release/
+          cd release
+          sha256sum $(ls | grep -v SHA256SUMS) > SHA256SUMS.txt 2>/dev/null || sha256sum * > SHA256SUMS.txt
+          ls -lah
       - uses: softprops/action-gh-release@v2
         with:
           files: release/*
