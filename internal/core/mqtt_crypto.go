@@ -1,5 +1,5 @@
 // go-stock-server/mqtt_crypto.go - OpenSSL 兼容 AES 加解密（与 Python mqtt_crypto 互通）
-package main
+package core
 
 import (
 	"crypto/aes"

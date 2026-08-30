@@ -3,7 +3,7 @@
 // 与 Python mqtt_protocol.py 对齐：OpenSSL 兼容 AES 加密、信封/msgId 去重、
 // 自消息过滤、ping-pong、subscribe/unsubscribe/list_subs、quote_push 推送、
 // 行情命令 (realtime/batch/kline/qfq/minute/intraday/name/quote_cache/health/config)。
-package main
+package core
 
 import (
 	"crypto/rand"

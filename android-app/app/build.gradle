@@ -1,0 +1,66 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.stock.server.shell'
+    compileSdk 34
+    defaultConfig {
+        applicationId "com.stock.server.shell"
+        minSdk 23
+        targetSdk 34
+        versionCode 1
+        versionName "2.0.0-shell"
+        ndk { abiFilters "arm64-v8a" }
+    }
+    buildTypes {
+        debug {
+            minifyEnabled false
+            debuggable true
+            signingConfig signingConfigs.debug
+        }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+
+    // preBuild：自动拷贝预编译 Go arm64 二进制到 res/raw/
+    tasks.preBuild {
+        doFirst {
+            def rawDir = file("src/main/res/raw")
+            rawDir.mkdirs()
+            def bin = new File(rawDir, "go_stock_server")
+            if (!bin.exists() || bin.length() < 10_000_000) {
+                def prebuilt = new File("/workspace/build-out/go-stock-server-android-arm64")
+                if (prebuilt.exists() && prebuilt.length() > 10_000_000) {
+                    println "[方案B-preBuild] 从 ${prebuilt.absolutePath} 拷贝 Go arm64 二进制"
+                    bin.bytes = prebuilt.bytes
+                    bin.setReadable(true, false)
+                } else {
+                    throw new GradleException(
+                        "缺少 Go 二进制。请先执行：\n" +
+                        "cd /workspace/go-stock-server && \\\n" +
+                        "GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build \\\n" +
+                        "  -o android-app/app/src/main/res/raw/go_stock_server ./cmd/server")
+                }
+            } else {
+                println "[方案B-preBuild] Go arm64 二进制已就位 (${String.format("%.1f", bin.length()/1024.0/1024.0)}MB)"
+            }
+        }
+    }
+}
+dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.12.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'androidx.preference:preference-ktx:1.2.1'
+    implementation 'androidx.work:work-runtime-ktx:2.9.1'
+}

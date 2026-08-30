@@ -6,7 +6,7 @@
 // 注意：Windows 上 SO_REUSEADDR 必须在 bind 之前设置，因此用 net.ListenConfig
 // 的 Control 回调在创建 socket 时设置，再手动加入组播组（对齐 Python zeroconf
 // 库的做法：SO_REUSEADDR + bind 0.0.0.0:5353 + IP_ADD_MEMBERSHIP）。
-package main
+package core
 
 import (
 	"context"

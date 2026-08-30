@@ -1,5 +1,5 @@
 // go-stock-server/discovery.go - 服务发现（mDNS 响应/宣告 + UDP 广播）
-package main
+package core
 
 import (
 	"encoding/json"

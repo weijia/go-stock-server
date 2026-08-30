@@ -3,7 +3,7 @@
 
 // go-stock-server/discovery_mdns.go - 非 Windows 平台的 mDNS 实现
 // 直接绑定 5353 组播端口，自行处理 mDNS 查询/宣告
-package main
+package core
 
 import (
 	"fmt"

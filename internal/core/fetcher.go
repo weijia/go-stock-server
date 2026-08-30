@@ -1,5 +1,5 @@
 // go-stock-server/fetcher.go - 股票数据获取（腾讯 HTTP API）
-package main
+package core
 
 import (
 	"bytes"
@@ -741,3 +741,15 @@ func (f *StockFetcher) FetchQfq(code string, days int) (*KlineResponse, string, 
 	}
 	return resp, source, false, nil
 }
+
+// ===== 方案 C / 外部包的导出别名 =====
+// （避免改变内部类型名，仅在文件末追加导出）
+
+// RealtimeQuote 是对外导出的实时行情结构（Fyne GUI / REST 客户端都用这个）
+type RealtimeQuote = RealtimeData
+
+// QuoteRecord 是批量行情中每只股票的记录（对外导出）
+type BatchQuoteRecord = QuoteRecord
+
+// GetLocalIP 返回非回环的本机 IPv4 地址（对外导出，GUI 显示本机 IP 用）
+func GetLocalIP() string { return getLocalIP() }

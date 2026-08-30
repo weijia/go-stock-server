@@ -1,5 +1,5 @@
 // go-stock-server/handlers.go - HTTP API 处理器
-package main
+package core
 
 import (
 	"encoding/json"
