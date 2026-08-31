@@ -1,316 +1,256 @@
 name: Build All Targets
-
-on:
+true:
   push:
-    branches: [ master, main ]
-    tags:     [ 'v*' ]
+    branches:
+    - master
+    - main
+    tags:
+    - v*
   pull_request:
-    branches: [ master, main ]
+    branches:
+    - master
+    - main
   workflow_dispatch:
     inputs:
       skip_apk_gui:
-        description: "跳过方案 C Fyne APK（慢，约 25 分钟）"
+        description: 跳过方案 C Fyne APK（慢，约 25 分钟）
         required: false
         type: boolean
         default: false
       skip_apk_shell:
-        description: "跳过方案 B Shell APK（约 10 分钟）"
+        description: 跳过方案 B Shell APK（约 10 分钟）
         required: false
         type: boolean
         default: false
-
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
-
 env:
-  GO_VERSION:   "1.25"
-  JDK_VERSION:  "17"
-  ANDROID_COMPILE_SDK: "34"
-  ANDROID_BUILD_TOOLS: "34.0.0"
-  ANDROID_NDK_VERSION: "26.3.11579264"
-  GOPROXY: "https://proxy.golang.org,direct"
-  # go-tdx 固定 commit（沙箱本地用 replace ../go-tdx，CI 上 clone 到 ../go-tdx 同 commit）
-  GO_TDX_COMMIT: "a9f773c55cf7279d047d8d1ad35b83d2970869ec"
-
+  GO_VERSION: '1.25'
+  JDK_VERSION: '17'
+  ANDROID_COMPILE_SDK: '34'
+  ANDROID_BUILD_TOOLS: 34.0.0
+  ANDROID_NDK_VERSION: 26.3.11579264
+  GOPROXY: https://proxy.golang.org,direct
+  GO_TDX_COMMIT: a9f773c55cf7279d047d8d1ad35b83d2970869ec
 jobs:
-
-  ###########################################################################
-  # CLI (方案 A) + vet + smoke
-  ###########################################################################
   cli:
-    name: "CLI (方案A) + vet + smoke"
+    name: CLI (方案A) + vet + smoke
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
+    - name: Checkout go-tdx dependency (replace => ../go-tdx)
+      run: 'set -e
 
-      - name: Checkout go-tdx dependency (replace => ../go-tdx)
-        run: |
-          set -e
-          cd ..
-          git clone --depth 50 https://github.com/weijia/go-tdx.git go-tdx
-          cd go-tdx
-          git checkout --quiet "$GO_TDX_COMMIT"
-          ls go.mod
+        cd ..
 
-      - name: Setup Go ${{ env.GO_VERSION }}
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: go.sum
+        git clone --depth 50 https://github.com/weijia/go-tdx.git go-tdx
 
-      - name: Go mod download & vet (non-GUI packages)
-        run: |
-          set -euo pipefail
-          go mod download
-          mapfile -t LIST < <(go list ./... | grep -v -E "cmd/android-gui")
-          CGO_ENABLED=0 go vet "${LIST[@]}"
+        cd go-tdx
 
-      - name: Build CLI binaries (方案A)
-        run: |
-          set -e
-          mkdir -p build-out
-          GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o build-out/go-stock-server-linux-amd64   ./cmd/server
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o build-out/go-stock-server-windows-amd64.exe ./cmd/server
-          GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o build-out/go-stock-server-android-arm64 ./cmd/server
-          ls -lh build-out/
+        git checkout --quiet "$GO_TDX_COMMIT"
 
-      - name: HTTP smoke (T1~T4 契约基线)
-        run: |
-          set -e
-          go build -o /tmp/srv ./cmd/server
-          /tmp/srv --db "" --host 127.0.0.1 --port 29700 > /tmp/srv.log 2>&1 & PID=$!
-          sleep 3
-          OUT=/tmp/snap.txt
-          : > "$OUT"
-          for t in "T1 /api/health" "T2 /api/config" "T3 /api/quote_cache"; do
-            name=${t% *}; url=${t#* }
-            echo "=== $name ===" >> "$OUT"
-            curl -s --max-time 5 "http://127.0.0.1:29700$url" \
-              | sed -E 's/"timestamp":"[^"]*"/"ts":"__"/g; s/"uptime_seconds":[0-9]+/"up":0/g; s/"start_time":"[^"]*"/"st":"__"/g' \
-              >> "$OUT"; echo "" >> "$OUT"
-          done
-          echo "=== T4 ===" >> "$OUT"
-          curl -s --max-time 5 -w "\nHTTP_STATUS:%{http_code}" \
-            "http://127.0.0.1:29700/api/node/config" \
-            | sed -E 's/"timestamp":"[^"]*"/"ts":"__"/g' >> "$OUT"
-          kill -SIGTERM "$PID" 2>/dev/null; wait "$PID" 2>/dev/null || true
-          cat "$OUT"
-          set +e
-          grep -q "HTTP_STATUS:400" "$OUT"          && echo "✅ T4 400 X-Node-ID correct"
-          grep -q "\"code\":200" "$OUT"              && echo "✅ T1~T3 200 OK"
+        ls go.mod
 
-      - name: Upload CLI artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: cli-binaries
-          path: build-out/go-stock-server-*
-          retention-days: 30
+        '
+    - name: Setup Go ${{ env.GO_VERSION }}
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        cache-dependency-path: go.sum
+    - name: Go mod download & vet (non-GUI packages)
+      run: 'set -euo pipefail
 
-  ###########################################################################
-  # Shell APK (方案 B)
-  ###########################################################################
+        go mod download
+
+        mapfile -t LIST < <(go list ./... | grep -v -E "cmd/android-gui")
+
+        CGO_ENABLED=0 go vet "${LIST[@]}"
+
+        '
+    - name: Build CLI binaries (方案A)
+      run: 'set -e
+
+        mkdir -p build-out
+
+        GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o build-out/go-stock-server-linux-amd64   ./cmd/server
+
+        GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o build-out/go-stock-server-windows-amd64.exe ./cmd/server
+
+        GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o build-out/go-stock-server-android-arm64 ./cmd/server
+
+        ls -lh build-out/
+
+        '
+    - name: HTTP smoke (T1~T4 契约基线)
+      run: "set -e\ngo build -o /tmp/srv ./cmd/server\n/tmp/srv --db \"\" --host 127.0.0.1 --port 29700 > /tmp/srv.log 2>&1 & PID=$!\nsleep 3\nOUT=/tmp/snap.txt\n: > \"$OUT\"\nfor t in \"T1 /api/health\" \"T2 /api/config\" \"T3 /api/quote_cache\"; do\n  name=${t% *}; url=${t#* }\n  echo \"=== $name ===\" >> \"$OUT\"\n  curl -s --max-time 5 \"http://127.0.0.1:29700$url\" \\\n    | sed -E 's/\"timestamp\":\"[^\"]*\"/\"ts\":\"__\"/g; s/\"uptime_seconds\":[0-9]+/\"up\":0/g; s/\"start_time\":\"[^\"]*\"/\"st\":\"__\"/g' \\\n    >> \"$OUT\"; echo \"\" >> \"$OUT\"\ndone\necho \"=== T4 ===\" >> \"$OUT\"\ncurl -s --max-time 5 -w \"\\nHTTP_STATUS:%{http_code}\" \\\n  \"http://127.0.0.1:29700/api/node/config\" \\\n  | sed -E 's/\"timestamp\":\"[^\"]*\"/\"ts\":\"__\"/g' >> \"$OUT\"\nkill -SIGTERM \"$PID\" 2>/dev/null; wait \"$PID\" 2>/dev/null || true\ncat \"$OUT\"\nset +e\ngrep -q \"HTTP_STATUS:400\" \"$OUT\"          && echo \"✅ T4 400 X-Node-ID correct\"\ngrep -q \"\\\"code\\\":200\" \"$OUT\"              && echo \"✅ T1~T3 200 OK\"\n"
+    - name: Upload CLI artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: cli-binaries
+        path: build-out/go-stock-server-*
+        retention-days: 30
   apk_shell:
-    name: "Shell APK (方案B)"
+    name: Shell APK (方案B)
     runs-on: ubuntu-latest
     timeout-minutes: 35
     if: ${{ !inputs.skip_apk_shell }}
     needs: cli
     steps:
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
+    - name: Checkout go-tdx dependency (replace => ../go-tdx)
+      run: 'set -e
 
-      - name: Checkout go-tdx dependency (replace => ../go-tdx)
-        run: |
-          set -e
-          cd ..
-          git clone --depth 50 https://github.com/weijia/go-tdx.git go-tdx
-          cd go-tdx
-          git checkout --quiet "$GO_TDX_COMMIT"
+        cd ..
 
-      - name: Setup Go ${{ env.GO_VERSION }}
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: go.sum
+        git clone --depth 50 https://github.com/weijia/go-tdx.git go-tdx
 
-      - name: Setup JDK ${{ env.JDK_VERSION }}
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: ${{ env.JDK_VERSION }}
+        cd go-tdx
 
-      - name: Setup Gradle 8.14.5
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.14.5"
-          cache-read-only: false
+        git checkout --quiet "$GO_TDX_COMMIT"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          cmdline-tools-version: 11076708
-          packages: >-
-            platforms;android-${{ env.ANDROID_COMPILE_SDK }}
-            build-tools;${{ env.ANDROID_BUILD_TOOLS }}
+        '
+    - name: Setup Go ${{ env.GO_VERSION }}
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        cache-dependency-path: go.sum
+    - name: Setup JDK ${{ env.JDK_VERSION }}
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: ${{ env.JDK_VERSION }}
+    - name: Setup Gradle 8.14.5
+      uses: gradle/actions/setup-gradle@v4
+      with:
+        gradle-version: 8.14.5
+        cache-read-only: false
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+      with:
+        cmdline-tools-version: 11076708
+        packages: platforms;android-${{ env.ANDROID_COMPILE_SDK }} build-tools;${{ env.ANDROID_BUILD_TOOLS }}
+    - name: Build Go arm64 binary & copy to Android raw
+      run: "set -e\nmkdir -p android-app/app/src/main/res/raw build-out\nGOOS=android GOARCH=arm64 CGO_ENABLED=0 \\\n  go build -ldflags=\"-s -w\" -o build-out/go-stock-server-android-arm64 ./cmd/server\ncp build-out/go-stock-server-android-arm64 \\\n   android-app/app/src/main/res/raw/go_stock_server\nls -lh android-app/app/src/main/res/raw/go_stock_server\n"
+    - name: Apply CI gradle.properties (no proxy)
+      run: cp android-app/gradle.properties.ci android-app/gradle.properties
+    - name: Gradle assembleDebug
+      working-directory: android-app
+      shell: bash
+      run: 'set -eo pipefail
 
-      - name: Build Go arm64 binary & copy to Android raw
-        run: |
-          set -e
-          mkdir -p android-app/app/src/main/res/raw build-out
-          GOOS=android GOARCH=arm64 CGO_ENABLED=0 \
-            go build -ldflags="-s -w" -o build-out/go-stock-server-android-arm64 ./cmd/server
-          cp build-out/go-stock-server-android-arm64 \
-             android-app/app/src/main/res/raw/go_stock_server
-          ls -lh android-app/app/src/main/res/raw/go_stock_server
+        CMD=gradle
 
-      - name: Apply CI gradle.properties (no proxy)
-        run: cp android-app/gradle.properties.ci android-app/gradle.properties
+        [ -x ./gradlew ] && CMD=./gradlew
 
-      - name: Gradle assembleDebug
-        working-directory: android-app
-        run: |
-          set -e
-          CMD="gradle"
-          [ -x ./gradlew ] && CMD="./gradlew"
-          $CMD --no-daemon --no-watch-fs --warning-mode all app:assembleDebug 2>&1 | tail -60
+        echo "用 $CMD 执行 app:assembleDebug (Gradle 用户 home: $GRADLE_USER_HOME)"
 
-      - name: Collect artifacts
-        run: |
-          mkdir -p build-out
-          cp android-app/app/build/outputs/apk/debug/app-debug.apk build-out/StockServerShell-debug.apk
-          ls -lh build-out/
+        set +e
 
-      - name: Upload Shell APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: StockServerShell-debug
-          path: build-out/StockServerShell-debug.apk
-          retention-days: 90
+        $CMD --no-daemon --no-watch-fs --warning-mode summary app:assembleDebug > /tmp/gradle_build.log 2>&1
 
-  ###########################################################################
-  # Fyne GUI APK (方案 C)
-  ###########################################################################
+        ST=$?
+
+        set -e
+
+        echo "--- assembleDebug 退出码=$ST ---"
+
+        echo "--- 日志尾部（最近 120 行） ---"
+
+        tail -n 120 /tmp/gradle_build.log || true
+
+        echo "--- 查找输出 APK ---"
+
+        find app/build -name "*.apk" -ls || true
+
+        exit $ST'
+    - name: Collect artifacts
+      run: "set -euo pipefail\nmkdir -p build-out\nAPK_PATH=\"$(find android-app/app/build -name \"*.apk\" -type f | head -n1)\"\nif [ -z \"$APK_PATH\" ]; then\n  echo \"❌ 找不到 APK，android-app 目录 tree：\"\n  find android-app -maxdepth 6 \\( -name build -o -name \"*.apk\" \\) -ls\n  exit 1\nfi\necho \"发现 APK：$APK_PATH ($(stat -c%s \"$APK_PATH\") bytes)\"\ncp \"$APK_PATH\" build-out/StockServerShell-debug.apk\nls -lh build-out/"
+    - name: Upload Shell APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: StockServerShell-debug
+        path: build-out/StockServerShell-debug.apk
+        retention-days: 90
   apk_gui:
-    name: "Fyne GUI APK (方案C)"
+    name: Fyne GUI APK (方案C)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     if: ${{ !inputs.skip_apk_gui }}
     needs: cli
     steps:
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
+    - name: Checkout go-tdx dependency (replace => ../go-tdx)
+      run: 'set -e
 
-      - name: Checkout go-tdx dependency (replace => ../go-tdx)
-        run: |
-          set -e
-          cd ..
-          git clone --depth 50 https://github.com/weijia/go-tdx.git go-tdx
-          cd go-tdx
-          git checkout --quiet "$GO_TDX_COMMIT"
+        cd ..
 
-      - name: Setup Go ${{ env.GO_VERSION }}
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: go.sum
+        git clone --depth 50 https://github.com/weijia/go-tdx.git go-tdx
 
-      - name: Setup JDK ${{ env.JDK_VERSION }}
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: ${{ env.JDK_VERSION }}
+        cd go-tdx
 
-      - name: Setup Android SDK + NDK
-        uses: android-actions/setup-android@v3
-        with:
-          cmdline-tools-version: 11076708
-          packages: >-
-            platforms;android-${{ env.ANDROID_COMPILE_SDK }}
-            build-tools;${{ env.ANDROID_BUILD_TOOLS }}
-            ndk;${{ env.ANDROID_NDK_VERSION }}
+        git checkout --quiet "$GO_TDX_COMMIT"
 
-      - name: Install Fyne CLI
-        run: |
-          GOPROXY=https://proxy.golang.org,direct GOBIN=/usr/local/bin \
-            go install fyne.io/fyne/v2/cmd/fyne@v2.8.1
-          fyne version
-
-      - name: Generate GUI icon
-        run: |
-          mkdir -p build-out
-          cat > /tmp/genicon.go <<'GO'
-          package main
-          import ("image"; "image/color"; "image/png"; "os")
-          func main() {
-            sz := 512
-            img := image.NewRGBA(image.Rect(0,0,sz,sz))
-            for y:=0; y<sz; y++ {
-              for x:=0; x<sz; x++ {
-                r := uint8(51 + int(float32(x)/float32(sz)*85))
-                img.Set(x,y,color.RGBA{r, 102, 170, 255})
-              }
-            }
-            f,_ := os.Create(os.Args[1])
-            defer f.Close()
-            png.Encode(f, img)
-          }
-          GO
-          go run /tmp/genicon.go build-out/gui_icon.png
-          ls -lh build-out/gui_icon.png
-
-      - name: Ensure gui_main.go in module root
-        run: |
-          set -e
-          [ -f gui_main.go ] || cp cmd/android-gui/main.go gui_main.go
-          head -1 gui_main.go | grep -q "^//go:build" || \
-            sed -i '1i //go:build android || ignore_gui_main' gui_main.go
-          head -4 gui_main.go
-
-      - name: Fyne package -os android
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
-        run: |
-          set -e
-          export ANDROID_NDK_HOME="${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/$ANDROID_NDK_VERSION"
-          [ -d "$ANDROID_NDK_HOME" ] || { echo "NDK 不存在，可用的 NDK:"; ls "$ANDROID_SDK_ROOT/ndk/"; exit 1; }
-          unset CGO_ENABLED
-          fyne package -os android \
-            -appID com.stock.server.gui \
-            -name  StockServerGUI \
-            -icon  build-out/gui_icon.png \
-            . 2>&1 | tail -40
-          ls -lh StockServerGUI.apk
-          mkdir -p build-out
-          cp StockServerGUI.apk build-out/StockServerGUI-debug.apk
-
-      - name: Upload Fyne GUI APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: StockServerGUI-debug
-          path: build-out/StockServerGUI-debug.apk
-          retention-days: 90
-
-  ###########################################################################
-  # Release (仅 tag v*)
-  ###########################################################################
+        '
+    - name: Setup Go ${{ env.GO_VERSION }}
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        cache-dependency-path: go.sum
+    - name: Setup JDK ${{ env.JDK_VERSION }}
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: ${{ env.JDK_VERSION }}
+    - name: Setup Android SDK + NDK
+      uses: android-actions/setup-android@v3
+      with:
+        cmdline-tools-version: 11076708
+        packages: platforms;android-${{ env.ANDROID_COMPILE_SDK }} build-tools;${{ env.ANDROID_BUILD_TOOLS }} ndk;${{ env.ANDROID_NDK_VERSION }}
+    - name: Install Fyne CLI
+      run: "GOPROXY=https://proxy.golang.org,direct GOBIN=/usr/local/bin \\\n  go install fyne.io/fyne/v2/cmd/fyne@v2.8.1\nfyne version\n"
+    - name: Generate GUI icon
+      run: "mkdir -p build-out\ncat > /tmp/genicon.go <<'GO'\npackage main\nimport (\"image\"; \"image/color\"; \"image/png\"; \"os\")\nfunc main() {\n  sz := 512\n  img := image.NewRGBA(image.Rect(0,0,sz,sz))\n  for y:=0; y<sz; y++ {\n    for x:=0; x<sz; x++ {\n      r := uint8(51 + int(float32(x)/float32(sz)*85))\n      img.Set(x,y,color.RGBA{r, 102, 170, 255})\n    }\n  }\n  f,_ := os.Create(os.Args[1])\n  defer f.Close()\n  png.Encode(f, img)\n}\nGO\ngo run /tmp/genicon.go build-out/gui_icon.png\nls -lh build-out/gui_icon.png\n"
+    - name: Ensure gui_main.go in module root
+      run: "set -e\n[ -f gui_main.go ] || cp cmd/android-gui/main.go gui_main.go\nhead -1 gui_main.go | grep -q \"^//go:build\" || \\\n  sed -i '1i //go:build android || ignore_gui_main' gui_main.go\nhead -4 gui_main.go\n"
+    - name: Fyne package -os android
+      env:
+        ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+      run: "set -e\nexport ANDROID_NDK_HOME=\"${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/$ANDROID_NDK_VERSION\"\n[ -d \"$ANDROID_NDK_HOME\" ] || { echo \"NDK 不存在，可用的 NDK:\"; ls \"$ANDROID_SDK_ROOT/ndk/\"; exit 1; }\nunset CGO_ENABLED\nfyne package -os android \\\n  -appID com.stock.server.gui \\\n  -name  StockServerGUI \\\n  -icon  build-out/gui_icon.png \\\n  . 2>&1 | tail -40\nls -lh StockServerGUI.apk\nmkdir -p build-out\ncp StockServerGUI.apk build-out/StockServerGUI-debug.apk\n"
+    - name: Upload Fyne GUI APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: StockServerGUI-debug
+        path: build-out/StockServerGUI-debug.apk
+        retention-days: 90
   release:
-    name: "GitHub Release（仅 tag v*）"
+    name: GitHub Release（仅 tag v*）
     runs-on: ubuntu-latest
     permissions:
       contents: write
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [cli, apk_shell, apk_gui]
+    needs:
+    - cli
+    - apk_shell
+    - apk_gui
     steps:
-      - uses: actions/download-artifact@v4
-        with: { path: release-artifacts }
-      - name: 扁平化 + 校验 SHA256
-        run: |
-          mkdir -p release
-          find release-artifacts -type f -exec cp {} release/ \;
-          cd release
-          sha256sum $(ls | grep -v SHA256SUMS) > SHA256SUMS.txt 2>/dev/null || sha256sum * > SHA256SUMS.txt
-          ls -lah
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: release/*
-          generate_release_notes: true
+    - uses: actions/download-artifact@v4
+      with:
+        path: release-artifacts
+    - name: 扁平化 + 校验 SHA256
+      run: 'mkdir -p release
+
+        find release-artifacts -type f -exec cp {} release/ \;
+
+        cd release
+
+        sha256sum $(ls | grep -v SHA256SUMS) > SHA256SUMS.txt 2>/dev/null || sha256sum * > SHA256SUMS.txt
+
+        ls -lah
+
+        '
+    - uses: softprops/action-gh-release@v2
+      with:
+        files: release/*
+        generate_release_notes: true

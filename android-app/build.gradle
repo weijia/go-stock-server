@@ -1,20 +1,32 @@
-// Top-level build file —— 方案 B（Android Shell）
+// Gradle 8.14 + AGP 8.4 兼容的 Groovy 语法：url = '...' （赋值式）
 buildscript {
     repositories {
-        maven { url 'https://maven.cdn.bytedance.com/repository/google' }
-        maven { url 'https://maven.cdn.bytedance.com/repository/public' }
-        maven { url 'https://repo.huaweicloud.com/repository/google/' }
-        maven { url 'https://repo.huaweicloud.com/repository/maven/' }
-        maven { url 'https://maven.aliyun.com/repository/google' }
-        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
         google()
         mavenCentral()
+        gradlePluginPortal()
+        maven { url = 'https://maven.aliyun.com/repository/google' }
+        maven { url = 'https://maven.aliyun.com/repository/public' }
+        maven { url = 'https://maven.aliyun.com/repository/gradle-plugin' }
+        maven { url = 'https://repo.huaweicloud.com/repository/google/' }
+        maven { url = 'https://repo.huaweicloud.com/repository/maven/' }
     }
     dependencies {
-        // AGP 8.4.2 是 2024 Q2 稳定版，支持 Gradle 8.4~8.7、JDK 17~21；实测在 JDK25/Gradle8.14 也 OK
         classpath 'com.android.tools.build:gradle:8.4.2'
         classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24'
     }
 }
-allprojects { tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' } }
-tasks.register('clean', Delete) { delete rootProject.buildDir }
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url = 'https://maven.aliyun.com/repository/google' }
+        maven { url = 'https://maven.aliyun.com/repository/public' }
+        maven { url = 'https://repo.huaweicloud.com/repository/google/' }
+        maven { url = 'https://repo.huaweicloud.com/repository/maven/' }
+    }
+}
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}
