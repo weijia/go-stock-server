@@ -107,12 +107,24 @@ func (f *StockFetcher) FetchKline(code string, days int) (*KlineResponse, error)
 	sym := apiCode(code)
 	url := fmt.Sprintf("http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s%s,day,,,%d,qfq", prefix, sym, days)
 
-	body, err := f.httpGet(url)
-	if err != nil {
-		return nil, fmt.Errorf("请求K线数据失败: %w", err)
+	for attempt := 0; attempt < 3; attempt++ {
+		body, err := f.httpGet(url)
+		if err != nil {
+			return nil, fmt.Errorf("请求K线数据失败: %w", err)
+		}
+		resp, err := f.parseKline(body, code, days)
+		if err == nil {
+			return resp, nil
+		}
+		// 腾讯对连续/高频请求（如批量拉 K 线）会间歇返回 data:[] 做节流，
+		// 退避重试自愈（400ms→800ms）；无效代码重试后仍返回同错，不影响。
+		if strings.Contains(err.Error(), "K线数据未找到") && attempt < 2 {
+			time.Sleep(400 * time.Millisecond * time.Duration(1<<uint(attempt)))
+			continue
+		}
+		return nil, err
 	}
-
-	return f.parseKline(body, code, days)
+	return nil, fmt.Errorf("K线数据获取失败")
 }
 
 // fetchHKKline 港股 K 线：腾讯当日快照（qt.gtimg.cn/q=hkXXXXX）构造 1 行未复权数据。
@@ -298,19 +310,33 @@ func (f *StockFetcher) parseKline(content, code string, days int) (*KlineRespons
 	key := fmt.Sprintf("%s%s", marketPrefix(code), apiCode(code))
 
 	var root struct {
-		Code int `json:"code"`
-		Data map[string]struct {
-			QfqDay [][]interface{} `json:"qfqday"`
-			Day    [][]interface{} `json:"day"`
-		} `json:"data"`
+		Code int             `json:"code"`
+		Data json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal([]byte(content), &root); err != nil {
 		return nil, fmt.Errorf("K线 JSON 解析失败: %w", err)
 	}
 
-	node, ok := root.Data[key]
+	// 腾讯对无效代码/参数错误返回 data:[]（空数组）或 data:null，而非
+	// 「代码->K线数据」对象；这类情况归一为明确的业务错误，避免误报 JSON 解析失败。
+	raw := bytes.TrimSpace(root.Data)
+	if len(raw) == 0 || string(raw) == "null" || raw[0] == '[' {
+		// 腾讯对无效代码返回 data:[]；对连续/高频请求（如批量拉 K 线）也会间歇返回
+		// 空数组做节流。统一归一为明确的业务错误，由 FetchKline 短暂重试自愈。
+		return nil, fmt.Errorf("K线数据未找到 %s（无效代码或接口暂无该股票K线）", code)
+	}
+
+	var dataMap map[string]struct {
+		QfqDay [][]interface{} `json:"qfqday"`
+		Day    [][]interface{} `json:"day"`
+	}
+	if err := json.Unmarshal(raw, &dataMap); err != nil {
+		return nil, fmt.Errorf("K线数据解析失败: %w", err)
+	}
+
+	node, ok := dataMap[key]
 	if !ok {
-		node, ok = root.Data[code]
+		node, ok = dataMap[code]
 		if !ok {
 			return nil, fmt.Errorf("K线数据未找到 %s", code)
 		}
