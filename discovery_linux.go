@@ -12,12 +12,15 @@ import (
 const ipCheckSecsLinux = 10
 
 // watchIPChange Linux 平台：周期性检测本机 IPv4 变化（短轮询）。
+// 协程在本进程生命周期内常驻（阻塞于 discoveryStop），不被 restartMDNS 重复拉起。
 func (d *ServiceDiscovery) watchIPChange() {
+	d.wg.Add(1)
+	defer d.wg.Done()
 	ticker := time.NewTicker(ipCheckSecsLinux * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-d.mdnsStop:
+		case <-d.discoveryStop:
 			return
 		case <-ticker.C:
 			d.onIPChanged(d.findLocalIPv4())

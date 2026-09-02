@@ -19,6 +19,11 @@ const (
 	mdnsPort          = 5353
 	mdnsMulticastIPv4 = "224.0.0.251"
 	mdnsAnnounceSecs  = 60 // 主动宣告间隔（秒）
+	// selfHealInterval 自检兜底周期：周期性重新探测主 IPv4，与当前不一致即重建 mDNS。
+	// 作为各平台 IP 变化事件之外的保底——休眠/换网后若系统事件未及时触发（地址变更、
+	// 早期 APIPA 阶段、或事件丢失），最多该周期后必然恢复。Linux/BSD 无 OS 地址变更
+	// 事件，纯靠轮询，故设为 30s 以在换网后快速自愈。
+	selfHealInterval = 30 * time.Second
 )
 
 // ServiceDiscovery 服务发现
@@ -37,9 +42,17 @@ type ServiceDiscovery struct {
 	udpStop      chan struct{}
 	broadcastCnt int
 
-	// ipNotifyCancel 取消 IP 变化监听（Windows 用 NotifyIpInterfaceChange 注册，
-	// 非 Windows 为 nil）。由平台 watchIPChange 设置，stopMDNS 时调用。
+	// ipNotifyCancel 取消 IP 变化监听（Windows 用 NotifyIpInterfaceChange /
+	// NotifyUnicastIpAddressChange 注册，非 Windows 为 nil）。由 watchIPChange 设置，
+	// Stop 时调用；watchIPChange 退出时也会自行取消。
 	ipNotifyCancel func()
+
+	// mu 保护 localIP / mDNS 重建，避免 selfHeal ticker 与 IP 事件回调并发重入。
+	mu sync.Mutex
+	// stopped 已停止标志，避免 Stop 之后仍触发重建。
+	stopped bool
+	// discoveryStop 整个发现生命周期的停止信号（watchIPChange / selfHealLoop 常驻）。
+	discoveryStop chan struct{}
 
 	wg sync.WaitGroup
 }
@@ -65,15 +78,23 @@ func (d *ServiceDiscovery) Start() {
 	}
 	d.fqdn = fmt.Sprintf("%s.%s.local", d.instanceName, mdnsServiceType)
 
+	d.discoveryStop = make(chan struct{})
 	d.startMDNS()
 	go d.udpBroadcastLoop()
 	// 事件驱动监听本机 IP 变化（换网/拔插网卡后客户端仍能发现），IP 一变即重建 mDNS
 	go d.watchIPChange()
+	// 周期自检兜底：即使系统 IP 变化事件漏报，也能在 selfHealInterval 内自愈
+	go d.selfHealLoop()
 }
 
-// onIPChanged 由平台 watchIPChange 在检测到 IP 变化时调用
+// onIPChanged 由平台 watchIPChange / selfHealLoop 在检测到 IP 变化时调用
 func (d *ServiceDiscovery) onIPChanged(newIP net.IP) {
 	if newIP == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.stopped {
 		return
 	}
 	if d.localIP != nil && d.localIP.Equal(newIP) {
@@ -88,21 +109,24 @@ func (d *ServiceDiscovery) onIPChanged(newIP net.IP) {
 	d.restartMDNS()
 }
 
-// restartMDNS 停止并重新启动 mDNS（IP 变化后调用）
+// restartMDNS 停止并重新启动 mDNS（IP 变化后调用）。注意：仅重建 mDNS socket/协程，
+// 不再重启 watchIPChange（其在本进程生命周期内常驻于 discoveryStop），避免重复注册
+// 导致 IP 监听句柄被旧协程的 defer 清掉而泄漏/失效。
 func (d *ServiceDiscovery) restartMDNS() {
-	if d.ipNotifyCancel != nil {
-		d.ipNotifyCancel() // 取消旧 IP 监听（Windows），避免重复注册泄漏
-		d.ipNotifyCancel = nil
-	}
 	d.stopMDNS()
 	d.mdnsStop = make(chan struct{})
 	d.startMDNS()
-	// stopMDNS 关闭了旧 mdnsStop，需重启 watch 协程以继续监听新通道
-	go d.watchIPChange()
 }
 
 // Stop 停止服务发现
 func (d *ServiceDiscovery) Stop() {
+	d.mu.Lock()
+	d.stopped = true
+	d.mu.Unlock()
+
+	if d.discoveryStop != nil {
+		close(d.discoveryStop)
+	}
 	if d.ipNotifyCancel != nil {
 		d.ipNotifyCancel()
 		d.ipNotifyCancel = nil
@@ -114,6 +138,25 @@ func (d *ServiceDiscovery) Stop() {
 		log.Printf("[服务发现-UDP] UDP 广播停止，共发送 %d 次广播", d.broadcastCnt)
 	}
 	d.wg.Wait()
+}
+
+// selfHealLoop 周期自检兜底：重新探测主 IPv4，与当前不一致即重建 mDNS。
+// 作为各平台 IP 变化事件之外的保底——休眠/换网后若系统事件未及时触发（地址变更、
+// 早期 APIPA 阶段、或事件丢失），最多 selfHealInterval 后必然恢复，不再依赖操作
+// 系统通知的可靠性。
+func (d *ServiceDiscovery) selfHealLoop() {
+	d.wg.Add(1)
+	defer d.wg.Done()
+	ticker := time.NewTicker(selfHealInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-d.discoveryStop:
+			return
+		case <-ticker.C:
+			d.onIPChanged(d.findLocalIPv4())
+		}
+	}
 }
 
 // isAPIPA 判断是否为 169.254.0.0/16 链路本地地址（多网卡/换网后残留，不能作为服务地址）

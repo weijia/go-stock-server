@@ -337,42 +337,60 @@ func (d *ServiceDiscovery) buildMDNSResponse(query *dns.Msg, srcIP net.IP) *dns.
 	return resp
 }
 
-// watchIPChange Windows 平台：通过 iphlpapi.NotifyIpInterfaceChange 注册回调，
-// 本机任意 IP 接口变化（获分配址/失效）即时触发，无需轮询。
+// watchIPChange Windows 平台：通过 iphlpapi 注册两类回调——
+//   · NotifyIpInterfaceChange      网卡增删/参数变化（唤醒后网卡 up/down）
+//   · NotifyUnicastIpAddressChange 地址变更（唤醒后 DHCP 重新分配 IP，主要缺这个）
+// 两者任一触发即重新探测主 IPv4 并交给 onIPChanged，无需轮询。该协程在本进程生命
+// 周期内常驻（阻塞于 discoveryStop），不会被 restartMDNS 重复拉起。
 func (d *ServiceDiscovery) watchIPChange() {
+	d.wg.Add(1)
+	defer d.wg.Done()
+
 	iphlpapi := windows.NewLazySystemDLL("iphlpapi.dll")
-	notifyProc := iphlpapi.NewProc("NotifyIpInterfaceChange")
+	notifyIfProc := iphlpapi.NewProc("NotifyIpInterfaceChange")
+	notifyAddrProc := iphlpapi.NewProc("NotifyUnicastIpAddressChange")
 	cancelProc := iphlpapi.NewProc("CancelMibChangeNotify2")
 
-	// 回调：IP 接口变化即重新探测主 IPv4 并交给 onIPChanged
+	// 回调：IP 接口或地址变化即重新探测主 IPv4 并交给 onIPChanged
 	callback := func(callerContext uintptr, row uintptr, notificationType uint32) uintptr {
 		d.onIPChanged(d.findLocalIPv4())
 		return 0
 	}
 	cb := windows.NewCallback(callback)
 
-	var handle windows.Handle
-	// Family=AF_UNSPEC(0) 监听 IPv4+IPv6；InitialNotification=FALSE(0)
-	rc, _, err := notifyProc.Call(
-		0, // AF_UNSPEC
-		cb,
-		0, // CallerContext
-		0, // InitialNotification = FALSE
-		uintptr(unsafe.Pointer(&handle)),
-	)
-	if rc != 0 {
-		log.Printf("[服务发现] 注册 IP 变化监听失败: %v", err)
+	var hIf, hAddr windows.Handle
+	rc1, _, err1 := notifyIfProc.Call(0, cb, 0, 0, uintptr(unsafe.Pointer(&hIf)))
+	rc2, _, err2 := notifyAddrProc.Call(0, cb, 0, 0, uintptr(unsafe.Pointer(&hAddr)))
+	if rc1 != 0 && rc2 != 0 {
+		log.Printf("[服务发现] 注册 IP 变化监听失败: if=%v addr=%v", err1, err2)
 		return
 	}
+	if rc1 == 0 {
+		log.Println("[服务发现] 已注册 Windows 接口变化监听（NotifyIpInterfaceChange）")
+	} else {
+		log.Printf("[服务发现] 注册接口变化监听失败: %v（仍依赖地址变化监听/自检兜底）", err1)
+	}
+	if rc2 == 0 {
+		log.Println("[服务发现] 已注册 Windows 地址变化监听（NotifyUnicastIpAddressChange）")
+	} else {
+		log.Printf("[服务发现] 注册地址变化监听失败: %v（休眠换网后的 IP 重分配可能漏报，靠自检兜底）", err2)
+	}
+
 	d.ipNotifyCancel = func() {
-		cancelProc.Call(uintptr(handle))
+		if hIf != 0 {
+			cancelProc.Call(uintptr(hIf))
+		}
+		if hAddr != 0 {
+			cancelProc.Call(uintptr(hAddr))
+		}
 	}
 	defer func() {
+		if d.ipNotifyCancel != nil {
+			d.ipNotifyCancel()
+		}
 		d.ipNotifyCancel = nil
 	}()
 
-	log.Println("[服务发现] 已注册 Windows IP 变化监听（NotifyIpInterfaceChange）")
-
-	// 阻塞等待退出信号；回调在独立线程触发，这里只负责在 Stop 时收尾
-	<-d.mdnsStop
+	// 常驻阻塞，等待整个发现停止（Stop 关闭 discoveryStop 时退出并取消监听）
+	<-d.discoveryStop
 }
