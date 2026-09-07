@@ -5,6 +5,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -28,6 +29,7 @@ class StockForegroundService : Service() {
 
     private var logThread: Thread? = null
     private var workingDir: File? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -88,6 +90,19 @@ class StockForegroundService : Service() {
         val bin = ensureBinary()
         val cmd = arrayListOf(bin.absolutePath).apply { addAll(args) }
         val logFile = File(workingDir, "server-${System.currentTimeMillis()}.log")
+
+        // 获取 WiFi MulticastLock，让 Go 二进制能接收 mDNS 多播查询包
+        try {
+            val wifi = getSystemService(Context.WIFI_SERVICE) as WifiManager
+            multicastLock = wifi.createMulticastLock("stock-server-mdns").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            Log.i("GoServer", "MulticastLock 已获取（mDNS 可收发）")
+        } catch (e: Exception) {
+            Log.w("GoServer", "MulticastLock 获取失败: ${e.message}（mDNS 仅宣告模式）")
+        }
+
         val proc = ProcessBuilder(cmd)
             .directory(workingDir)
             .redirectErrorStream(true)
@@ -141,6 +156,9 @@ class StockForegroundService : Service() {
     private fun stopServer() {
         runStatus = 0
         val proc = processRef.getAndSet(null) ?: return
+        // 释放 MulticastLock
+        try { multicastLock?.let { if (it.isHeld) it.release() } } catch (e: Exception) {}
+        multicastLock = null
         runCatching {
             proc.destroy()        // 先发 SIGTERM（等价 Go 侧的）
             Thread.sleep(1500)

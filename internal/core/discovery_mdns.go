@@ -28,7 +28,8 @@ func (d *ServiceDiscovery) stopMDNS() {
 func (d *ServiceDiscovery) startMDNS() {
 	iface, err := d.findInterfaceByIP(d.localIP)
 	if err != nil {
-		log.Printf("[服务发现-mDNS] 找不到 IP %s 对应的网卡: %v", d.localIP, err)
+		log.Printf("[服务发现-mDNS] 找不到 IP %s 对应的网卡: %v，降级为仅宣告模式", d.localIP, err)
+		d.startMDNSAnnounceOnly()
 		return
 	}
 
@@ -37,7 +38,8 @@ func (d *ServiceDiscovery) startMDNS() {
 		Port: mdnsPort,
 	})
 	if err != nil {
-		log.Printf("[服务发现-mDNS] 组播绑定失败: %v", err)
+		log.Printf("[服务发现-mDNS] 组播绑定失败: %v，降级为仅宣告模式", err)
+		d.startMDNSAnnounceOnly()
 		return
 	}
 	d.mdnsConn = conn
@@ -54,6 +56,29 @@ func (d *ServiceDiscovery) startMDNS() {
 	go d.mdnsRespondLoop()
 
 	// 主动宣告协程（即使收不到查询也能被发现）
+	d.wg.Add(1)
+	go d.mdnsAnnounceLoop()
+}
+
+// startMDNSAnnounceOnly 仅发送多播宣告，不接收查询
+// Android 无 CHANGE_WIFI_MULTICAST_STATE 权限时 fallback：
+// 用普通 UDP socket 发送多播包（发送多播只需 INTERNET 权限，不需要 join multicast group）
+func (d *ServiceDiscovery) startMDNSAnnounceOnly() {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		log.Printf("[服务发现-mDNS] UDP socket 创建失败: %v", err)
+		return
+	}
+	// TTL 和出口接口用系统默认值（同一子网内 TTL=1 足够，默认路由接口通常是 WiFi）
+	d.mdnsConn = conn
+	d.mdnsOK = true
+
+	log.Println("[服务发现-mDNS] 仅宣告模式（不接收查询）")
+	log.Printf("[服务发现-mDNS] 服务实例: %s", d.fqdn)
+	log.Printf("[服务发现-mDNS] 地址: %s:%d", d.localIP, d.httpPort)
+	log.Println("[服务发现-mDNS] 主动宣告: 每 60 秒发送一次（局域网可发现）")
+
+	// 只启动宣告协程，不启动查询响应协程
 	d.wg.Add(1)
 	go d.mdnsAnnounceLoop()
 }
