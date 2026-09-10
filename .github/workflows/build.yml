@@ -241,7 +241,25 @@ jobs:
         ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
       run: "set -e\nexport ANDROID_NDK_HOME=\"${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/$ANDROID_NDK_VERSION\"\n[ -d \"$ANDROID_NDK_HOME\" ] || { echo \"NDK 不存在，可用的 NDK:\"; ls \"$ANDROID_SDK_ROOT/ndk/\"; exit 1; }\nunset CGO_ENABLED\nfyne package -os android \\\n  -appID com.stock.server.gui \\\n  -name  StockServerGUI \\\n  -icon  build-out/gui_icon.png \\\n  -appVersion $VERSION \\\n  -appBuild ${GITHUB_RUN_NUMBER} \\\n  . 2>&1 | tail -40\nls -lh StockServerGUI.apk\n"
     - name: Inject Android permissions (CHANGE_WIFI_MULTICAST_STATE 等) via apktool
-      run: "set -e\nwget -q -O /tmp/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar\njava -jar /tmp/apktool.jar d -f -o /tmp/decoded StockServerGUI.apk\nMANIFEST=/tmp/decoded/AndroidManifest.xml\npython3 -c \"\nimport re\nwith open('$MANIFEST','r') as f: s=f.read()\nperms='<uses-permission android:name=\\\"android.permission.ACCESS_NETWORK_STATE\\\"/>\\n<uses-permission android:name=\\\"android.permission.ACCESS_WIFI_STATE\\\"/>\\n<uses-permission android:name=\\\"android.permission.CHANGE_WIFI_MULTICAST_STATE\\\"/>\\n<uses-permission android:name=\\\"android.permission.CHANGE_WIFI_STATE\\\"/>'\nif 'CHANGE_WIFI_MULTICAST_STATE' not in s: s=s.replace('</manifest>', perms+'</manifest>')\nwith open('$MANIFEST','w') as f: f.write(s)\n\"\ngrep -E 'uses-permission' \"$MANIFEST\" || true\njava -jar /tmp/apktool.jar b -o /tmp/StockServerGUI-patched.apk /tmp/decoded\nAPKSIGNER=\"${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner\"\nKEYSTORE=\"$HOME/.android/debug.keystore\"\nif [ ! -f \"$KEYSTORE\" ]; then\n  keytool -genkey -v -keystore \"$KEYSTORE\" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname \"CN=Android Debug,O=Android,C=US\"\nfi\n\"${APKSIGNER}\" sign --ks \"$KEYSTORE\" --ks-pass pass:android --key-pass pass:android --out build-out/StockServerGUI-debug.apk /tmp/StockServerGUI-patched.apk\n\"${APKSIGNER}\" verify --print-certs build-out/StockServerGUI-debug.apk\nmkdir -p build-out\nls -lh build-out/StockServerGUI-debug.apk\n"
+      run: |
+        set -ex
+        wget -q -O /tmp/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+        java -jar /tmp/apktool.jar d -f -o /tmp/decoded StockServerGUI.apk
+        MANIFEST=/tmp/decoded/AndroidManifest.xml
+        grep -q 'CHANGE_WIFI_MULTICAST_STATE' "$MANIFEST" || \
+          sed -i 's|</manifest>|<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/><uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/><uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/><uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/></manifest>|' "$MANIFEST"
+        grep -E 'uses-permission' "$MANIFEST" || true
+        java -jar /tmp/apktool.jar b -o /tmp/StockServerGUI-patched.apk /tmp/decoded
+        APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+        ls -la "${APKSIGNER}" || (echo "apksigner not found, listing build-tools:" && ls "${ANDROID_SDK_ROOT}/build-tools/" && exit 1)
+        KEYSTORE="$HOME/.android/debug.keystore"
+        if [ ! -f "$KEYSTORE" ]; then
+          keytool -genkey -v -keystore "$KEYSTORE" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+        fi
+        mkdir -p build-out
+        "${APKSIGNER}" sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android --out build-out/StockServerGUI-debug.apk /tmp/StockServerGUI-patched.apk
+        "${APKSIGNER}" verify --print-certs build-out/StockServerGUI-debug.apk
+        ls -lh build-out/StockServerGUI-debug.apk
 
     - name: Upload Fyne GUI APK
       uses: actions/upload-artifact@v4
