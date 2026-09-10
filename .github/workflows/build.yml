@@ -69,16 +69,24 @@ jobs:
         CGO_ENABLED=0 go vet "${LIST[@]}"
 
         '
+    - name: Extract version from git tag
+      id: version
+      run: |
+        VERSION=${GITHUB_REF_NAME#v}
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
     - name: Build CLI binaries (方案A)
       run: 'set -e
 
         mkdir -p build-out
 
-        GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o build-out/go-stock-server-linux-amd64   ./cmd/server
+        LDFLAGS="-s -w -X go-stock-server/internal/core/handlers.serverVersion=$VERSION"
 
-        GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o build-out/go-stock-server-windows-amd64.exe ./cmd/server
+        GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o build-out/go-stock-server-linux-amd64   ./cmd/server
 
-        GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o build-out/go-stock-server-android-arm64 ./cmd/server
+        GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o build-out/go-stock-server-windows-amd64.exe ./cmd/server
+
+        GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o build-out/go-stock-server-android-arm64 ./cmd/server
 
         ls -lh build-out/
 
@@ -131,13 +139,22 @@ jobs:
       with:
         cmdline-tools-version: 11076708
         packages: platforms;android-${{ env.ANDROID_COMPILE_SDK }} build-tools;${{ env.ANDROID_BUILD_TOOLS }}
+    - name: Extract version from git tag
+      id: version
+      run: |
+        VERSION=${GITHUB_REF_NAME#v}
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+        echo "VERSION_CODE=${GITHUB_RUN_NUMBER}" >> $GITHUB_ENV
     - name: Build Go arm64 binary & copy to Android raw
-      run: "set -e\nmkdir -p android-app/app/src/main/res/raw build-out\nGOOS=android GOARCH=arm64 CGO_ENABLED=0 \\\n  go build -ldflags=\"-s -w\" -o build-out/go-stock-server-android-arm64 ./cmd/server\ncp build-out/go-stock-server-android-arm64 \\\n   android-app/app/src/main/res/raw/go_stock_server\nls -lh android-app/app/src/main/res/raw/go_stock_server\n"
+      run: "set -e\nmkdir -p android-app/app/src/main/res/raw build-out\nGOOS=android GOARCH=arm64 CGO_ENABLED=0 \\\n  LDFLAGS=\"-s -w -X go-stock-server/internal/core/handlers.serverVersion=$VERSION\"\nGOOS=android GOARCH=arm64 CGO_ENABLED=0 \\\n  go build -ldflags=\"$LDFLAGS\" -o build-out/go-stock-server-android-arm64 ./cmd/server\ncp build-out/go-stock-server-android-arm64 \\\n   android-app/app/src/main/res/raw/go_stock_server\nls -lh android-app/app/src/main/res/raw/go_stock_server\n"
     - name: Apply CI gradle.properties (no proxy)
       run: cp android-app/gradle.properties.ci android-app/gradle.properties
     - name: Gradle assembleDebug
       working-directory: android-app
       shell: bash
+      env:
+        VERSION_CODE: ${{ env.VERSION_CODE }}
+        VERSION_NAME: ${{ env.VERSION }}
       run: 'set -eo pipefail
 
         CMD=gradle
@@ -212,12 +229,17 @@ jobs:
       run: "GOPROXY=https://proxy.golang.org,direct GOBIN=/usr/local/bin \\\n  go install fyne.io/fyne/v2/cmd/fyne@v2.8.1\nfyne version\n"
     - name: Generate GUI icon
       run: "mkdir -p build-out\ncat > /tmp/genicon.go <<'GO'\npackage main\nimport (\"image\"; \"image/color\"; \"image/png\"; \"os\")\nfunc main() {\n  sz := 512\n  img := image.NewRGBA(image.Rect(0,0,sz,sz))\n  for y:=0; y<sz; y++ {\n    for x:=0; x<sz; x++ {\n      r := uint8(51 + int(float32(x)/float32(sz)*85))\n      img.Set(x,y,color.RGBA{r, 102, 170, 255})\n    }\n  }\n  f,_ := os.Create(os.Args[1])\n  defer f.Close()\n  png.Encode(f, img)\n}\nGO\ngo run /tmp/genicon.go build-out/gui_icon.png\nls -lh build-out/gui_icon.png\n"
+    - name: Extract version from git tag
+      id: version
+      run: |
+        VERSION=${GITHUB_REF_NAME#v}
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
     - name: Ensure gui_main.go in module root
       run: "set -e\n[ -f gui_main.go ] || cp cmd/android-gui/main.go gui_main.go\nhead -1 gui_main.go | grep -q \"^//go:build\" || \\\n  sed -i '1i //go:build android || ignore_gui_main' gui_main.go\nhead -4 gui_main.go\n"
     - name: Fyne package -os android
       env:
         ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
-      run: "set -e\nexport ANDROID_NDK_HOME=\"${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/$ANDROID_NDK_VERSION\"\n[ -d \"$ANDROID_NDK_HOME\" ] || { echo \"NDK 不存在，可用的 NDK:\"; ls \"$ANDROID_SDK_ROOT/ndk/\"; exit 1; }\nunset CGO_ENABLED\nfyne package -os android \\\n  -appID com.stock.server.gui \\\n  -name  StockServerGUI \\\n  -icon  build-out/gui_icon.png \\\n  . 2>&1 | tail -40\nls -lh StockServerGUI.apk\nmkdir -p build-out\ncp StockServerGUI.apk build-out/StockServerGUI-debug.apk\n"
+      run: "set -e\nexport ANDROID_NDK_HOME=\"${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/$ANDROID_NDK_VERSION\"\n[ -d \"$ANDROID_NDK_HOME\" ] || { echo \"NDK 不存在，可用的 NDK:\"; ls \"$ANDROID_SDK_ROOT/ndk/\"; exit 1; }\nunset CGO_ENABLED\nfyne package -os android \\\n  -appID com.stock.server.gui \\\n  -name  StockServerGUI \\\n  -icon  build-out/gui_icon.png \\\n  -ldflags \"-s -w -X go-stock-server/internal/core/handlers.serverVersion=$VERSION\" \\\n  . 2>&1 | tail -40\nls -lh StockServerGUI.apk\nmkdir -p build-out\ncp StockServerGUI.apk build-out/StockServerGUI-debug.apk\n"
     - name: Upload Fyne GUI APK
       uses: actions/upload-artifact@v4
       with:

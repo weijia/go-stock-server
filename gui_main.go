@@ -131,6 +131,9 @@ func (g *guiApp) buildSettingsTab() *fyne.Container {
 	g.startBtn.Importance = widget.HighImportance
 	g.stopBtn  = widget.NewButtonWithIcon("■ 停止", theme.MediaStopIcon(), g.stopServer)
 	g.stopBtn.Importance = widget.DangerImportance
+	versionLbl := widget.NewLabel("版本 v" + core.Version())
+	versionLbl.TextStyle = fyne.TextStyle{Monospace: true}
+	versionLbl.Importance = widget.LowImportance
 	urlCard := widget.NewCard("浏览器 / 客户端访问", "", container.NewVBox(
 		widget.NewLabel("同 WiFi 下访问："),
 		widget.NewLabel("健康检查：  http://<本机IP>:端口/api/health"),
@@ -138,7 +141,7 @@ func (g *guiApp) buildSettingsTab() *fyne.Container {
 		widget.NewLabel("批量：         /api/batch/quotes?codes=000001,601318,600519"),
 	))
 	return container.NewVBox(
-		widget.NewCard("运行状态", "", container.NewVBox(g.statusLbl, g.ipLbl)),
+		widget.NewCard("运行状态", "", container.NewVBox(g.statusLbl, g.ipLbl, versionLbl)),
 		widget.NewCard("启动配置", "", form),
 		container.NewGridWithColumns(2, g.startBtn, g.stopBtn),
 		urlCard,

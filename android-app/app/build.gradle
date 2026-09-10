@@ -10,8 +10,11 @@ android {
         applicationId = "com.stock.server.shell"
         minSdk = 23
         targetSdk = 34
-        versionCode = 1
-        versionName = "2.0.0-shell"
+        // 从环境变量读取版本号（CI 用 git tag 注入）；本地默认值
+        def vCode = (System.env.VERSION_CODE ?: "1").toInteger()
+        def vName = System.env.VERSION_NAME ?: "2.0.6-dev"
+        versionCode = vCode
+        versionName = vName
         ndk { abiFilters("arm64-v8a") }
     }
     buildTypes {

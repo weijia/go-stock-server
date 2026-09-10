@@ -62,20 +62,34 @@ func (d *ServiceDiscovery) startMDNS() {
 
 // startMDNSAnnounceOnly 仅发送多播宣告，不接收查询
 // Android 无 CHANGE_WIFI_MULTICAST_STATE 权限时 fallback：
-// 用普通 UDP socket 发送多播包（发送多播只需 INTERNET 权限，不需要 join multicast group）
+// 用 DialUDP 连接到多播地址，系统自动选择出口接口（通常是 WiFi）
+// 发送多播只需 INTERNET 权限，不需要 CHANGE_WIFI_MULTICAST_STATE
 func (d *ServiceDiscovery) startMDNSAnnounceOnly() {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	// 用 DialUDP 创建 connected socket，系统自动选择出口接口（默认路由）
+	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{
+		IP:   net.ParseIP(mdnsMulticastIPv4),
+		Port: mdnsPort,
+	})
 	if err != nil {
 		log.Printf("[服务发现-mDNS] UDP socket 创建失败: %v", err)
 		return
 	}
-	// TTL 和出口接口用系统默认值（同一子网内 TTL=1 足够，默认路由接口通常是 WiFi）
 	d.mdnsConn = conn
 	d.mdnsOK = true
+	d.mdnsAnnounceOnly = true
+
+	// 如果 localIP 是 nil，尝试用 conn 的本地地址
+	if d.localIP == nil {
+		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil {
+			d.localIP = addr.IP
+		}
+	}
 
 	log.Println("[服务发现-mDNS] 仅宣告模式（不接收查询）")
 	log.Printf("[服务发现-mDNS] 服务实例: %s", d.fqdn)
-	log.Printf("[服务发现-mDNS] 地址: %s:%d", d.localIP, d.httpPort)
+	if d.localIP != nil {
+		log.Printf("[服务发现-mDNS] 地址: %s:%d", d.localIP, d.httpPort)
+	}
 	log.Println("[服务发现-mDNS] 主动宣告: 每 60 秒发送一次（局域网可发现）")
 
 	// 只启动宣告协程，不启动查询响应协程
@@ -218,9 +232,17 @@ func (d *ServiceDiscovery) sendMDNSAnnouncement() {
 		return
 	}
 
-	dst := &net.UDPAddr{IP: net.ParseIP(mdnsMulticastIPv4), Port: mdnsPort}
-	if _, err := d.mdnsConn.WriteToUDP(data, dst); err != nil {
-		log.Printf("[服务发现-mDNS] 宣告发送失败: %v", err)
+	// announce-only 模式：DialUDP 创建的 connected socket，用 Write 发送
+	// 完整模式：ListenMulticastUDP 创建的 unconnected socket，用 WriteToUDP 发送
+	if d.mdnsAnnounceOnly {
+		if _, err := d.mdnsConn.Write(data); err != nil {
+			log.Printf("[服务发现-mDNS] 宣告发送失败: %v", err)
+		}
+	} else {
+		dst := &net.UDPAddr{IP: net.ParseIP(mdnsMulticastIPv4), Port: mdnsPort}
+		if _, err := d.mdnsConn.WriteToUDP(data, dst); err != nil {
+			log.Printf("[服务发现-mDNS] 宣告发送失败: %v", err)
+		}
 	}
 }
 

@@ -12,7 +12,7 @@ import (
 )
 
 var serverStartTime = time.Now()
-var serverVersion = "2.0.0-go"
+var serverVersion = "2.0.6-dev"
 
 // StockHandler HTTP 请求处理器
 type StockHandler struct {

@@ -31,6 +31,7 @@ type ServiceDiscovery struct {
 	mdnsConn    *net.UDPConn
 	mdnsStop    chan struct{}
 	mdnsOK      bool
+	mdnsAnnounceOnly bool   // 仅宣告模式（无多播接收权限时）
 	queryCnt    int // 收到的查询数
 
 	udpConn      *net.UDPConn
@@ -59,7 +60,9 @@ func NewServiceDiscovery(httpPort int) *ServiceDiscovery {
 func (d *ServiceDiscovery) Start() {
 	d.localIP = d.findLocalIPv4()
 	if d.localIP == nil {
-		log.Println("[服务发现] 无法获取本机 IPv4，仅启动 UDP 广播")
+		log.Println("[服务发现] 无法获取本机 IPv4，mDNS 降级为仅宣告模式")
+		d.fqdn = fmt.Sprintf("%s.%s.local", d.instanceName, mdnsServiceType)
+		d.startMDNSAnnounceOnly()
 		go d.udpBroadcastLoop()
 		return
 	}
