@@ -4,5 +4,4 @@ Website = "https://github.com/weijia/go-stock-server"
 Icon = "build-out/gui_icon.png"
 Name = "StockServerGUI"
 ID = "com.stock.server.gui"
-Version = "2.0.6"
-Build = 1
+# Version 和 Build 由 CI 的 -appVersion/-appBuild 参数覆盖
