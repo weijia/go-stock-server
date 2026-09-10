@@ -44,6 +44,12 @@ func (d *ServiceDiscovery) stopMDNS() {
 	}
 }
 
+// startMDNSAnnounceOnly Windows 上的仅宣告模式（直接走完整 startMDNS）
+// Windows 通常有多播权限，不会走到这里；仅为满足 discovery.go 的跨平台调用
+func (d *ServiceDiscovery) startMDNSAnnounceOnly() {
+	d.startMDNS()
+}
+
 // startMDNS 启动 mDNS 宣告与查询响应（共享端口 5353）
 func (d *ServiceDiscovery) startMDNS() {
 	iface, err := d.findInterfaceByIP(d.localIP)
