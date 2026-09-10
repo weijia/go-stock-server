@@ -248,12 +248,19 @@ func (d *ServiceDiscovery) sendMDNSAnnouncement() {
 
 	data, err := msg.Pack()
 	if err != nil {
+		log.Printf("[服务发现-mDNS] 宣告 Pack 失败: %v", err)
 		return
 	}
 
 	dst := &net.UDPAddr{IP: net.ParseIP(mdnsMulticastIPv4), Port: mdnsPort}
-	if _, err := d.mdnsConn.WriteToUDP(data, dst); err != nil {
+	sent, err := d.mdnsConn.WriteToUDP(data, dst)
+	if err != nil {
 		log.Printf("[服务发现-mDNS] 宣告发送失败: %v", err)
+	} else {
+		d.announceCnt++
+		if d.announceCnt <= 3 || d.announceCnt%10 == 0 {
+			log.Printf("[服务发现-mDNS] 宣告 #%d 已发送 (%d bytes)", d.announceCnt, sent)
+		}
 	}
 }
 

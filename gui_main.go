@@ -10,6 +10,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -43,6 +44,7 @@ type guiApp struct {
 	swDebug   *widget.Check
 	statusLbl *widget.Label
 	ipLbl     *widget.Label
+	mdnsLbl   *widget.Label // mDNS 状态
 	startBtn  *widget.Button
 	stopBtn   *widget.Button
 
@@ -56,12 +58,28 @@ type guiApp struct {
 	logMu   sync.Mutex
 }
 
+// guiLogWriter 把标准 log 包的输出重定向到 GUI 日志 Tab
+type guiLogWriter struct{ g *guiApp }
+
+func (w *guiLogWriter) Write(p []byte) (int, error) {
+	line := strings.TrimRight(string(p), "\n\r")
+	if line != "" {
+		w.g.appendLog(line)
+	}
+	return len(p), nil
+}
+
 func main() {
 	g := &guiApp{
 		app:     app.NewWithID("com.stock.server.gui"),
 		cfg:     core.DefaultConfig(),
 		running: binding.NewBool(),
 	}
+	// 关键：把标准 log 输出重定向到 GUI 日志 Tab
+	// 这样 ServiceDiscovery / StartServer 的所有 log.Println 都会在 GUI 里看到
+	log.SetOutput(&guiLogWriter{g: g})
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
+
 	g.app.Settings().SetTheme(theme.DefaultTheme())
 	g.win = g.app.NewWindow("📈 股票行情服务器 v" + g.version())
 	g.win.Resize(fyne.NewSize(420, 720))
@@ -83,13 +101,38 @@ func (g *guiApp) refreshRunState(r bool) {
 		g.statusLbl.SetText("✅ 运行中")
 		g.statusLbl.Importance = widget.SuccessImportance
 		g.ipLbl.SetText(fmt.Sprintf("本机 IP：%s    端口：%d", core.GetLocalIP(), g.cfg.Port))
+		g.refreshMDNSStatus()
 	} else {
 		g.statusLbl.SetText("⏸ 已停止")
 		g.statusLbl.Importance = widget.DangerImportance
 		g.ipLbl.SetText("")
+		g.mdnsLbl.SetText("mDNS: 未启动")
 	}
 	if r { g.startBtn.Disable(); g.stopBtn.Enable()
 	} else { g.startBtn.Enable();  g.stopBtn.Disable() }
+}
+
+// refreshMDNSStatus 从 RunningServer 获取 mDNS 状态并更新 UI
+func (g *guiApp) refreshMDNSStatus() {
+	g.mu.Lock()
+	rs := g.server
+	g.mu.Unlock()
+	if rs == nil {
+		g.mdnsLbl.SetText("mDNS: 未启动")
+		return
+	}
+	st := rs.DiscoveryStatus()
+	var mode string
+	switch {
+	case !st.Running:
+		mode = "未启动"
+	case st.AnnounceOnly:
+		mode = "仅宣告"
+	default:
+		mode = "完整模式"
+	}
+	g.mdnsLbl.SetText(fmt.Sprintf("mDNS: %s | IP:%s | 宣告:%d | 查询:%d",
+		mode, st.LocalIP, st.AnnounceCount, st.QueryCount))
 }
 
 func (g *guiApp) buildTabs() {
@@ -127,6 +170,9 @@ func (g *guiApp) buildSettingsTab() *fyne.Container {
 	g.statusLbl.TextStyle = fyne.TextStyle{Bold: true}
 	g.statusLbl.Importance = widget.DangerImportance
 	g.ipLbl = widget.NewLabel("")
+	g.mdnsLbl = widget.NewLabel("mDNS: 未启动")
+	g.mdnsLbl.TextStyle = fyne.TextStyle{Monospace: true}
+	g.mdnsLbl.Importance = widget.LowImportance
 	g.startBtn = widget.NewButtonWithIcon("▶ 启动服务器", theme.MediaPlayIcon(), g.startServer)
 	g.startBtn.Importance = widget.HighImportance
 	g.stopBtn  = widget.NewButtonWithIcon("■ 停止", theme.MediaStopIcon(), g.stopServer)
@@ -141,7 +187,7 @@ func (g *guiApp) buildSettingsTab() *fyne.Container {
 		widget.NewLabel("批量：         /api/batch/quotes?codes=000001,601318,600519"),
 	))
 	return container.NewVBox(
-		widget.NewCard("运行状态", "", container.NewVBox(g.statusLbl, g.ipLbl, versionLbl)),
+		widget.NewCard("运行状态", "", container.NewVBox(g.statusLbl, g.ipLbl, g.mdnsLbl, versionLbl)),
 		widget.NewCard("启动配置", "", form),
 		container.NewGridWithColumns(2, g.startBtn, g.stopBtn),
 		urlCard,

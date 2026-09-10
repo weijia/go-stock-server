@@ -54,6 +54,15 @@ type RunningServer struct {
 	Addr       string
 	HTTPServer *http.Server
 	Stop       func() error
+	discovery  *ServiceDiscovery
+}
+
+// DiscoveryStatus 返回服务发现的当前状态（供 GUI 调试用）
+func (rs *RunningServer) DiscoveryStatus() DiscoveryStatus {
+	if rs == nil || rs.discovery == nil {
+		return DiscoveryStatus{}
+	}
+	return rs.discovery.Status()
 }
 
 // Version 返回服务器版本号
@@ -241,6 +250,7 @@ func startFromConfig(cfg ServerConfig, block bool) (*RunningServer, error) {
 	rs := &RunningServer{
 		Addr:       httpSrv.Addr,
 		HTTPServer: httpSrv,
+		discovery:  discovery,
 	}
 	rs.Stop = func() error {
 		log.Println("服务器停止")

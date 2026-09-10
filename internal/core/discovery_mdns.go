@@ -61,27 +61,36 @@ func (d *ServiceDiscovery) startMDNS() {
 }
 
 // startMDNSAnnounceOnly 仅发送多播宣告，不接收查询
-// Android 无 CHANGE_WIFI_MULTICAST_STATE 权限时 fallback：
-// 用 DialUDP 连接到多播地址，系统自动选择出口接口（通常是 WiFi）
-// 发送多播只需 INTERNET 权限，不需要 CHANGE_WIFI_MULTICAST_STATE
+// Android 无 CHANGE_WIFI_MULTICAST_STATE 权限时的 fallback：
+// 方案1：DialUDP 连接到多播地址（系统选出口接口，只需 INTERNET 权限）
+// 方案2（fallback）：ListenUDP 绑定 0.0.0.0:0 + WriteToUDP（兼容性更好）
 func (d *ServiceDiscovery) startMDNSAnnounceOnly() {
-	// 用 DialUDP 创建 connected socket，系统自动选择出口接口（默认路由）
+	// 方案1：DialUDP 创建 connected socket
 	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{
 		IP:   net.ParseIP(mdnsMulticastIPv4),
 		Port: mdnsPort,
 	})
 	if err != nil {
-		log.Printf("[服务发现-mDNS] UDP socket 创建失败: %v", err)
-		return
+		log.Printf("[服务发现-mDNS] DialUDP 创建失败: %v，尝试 ListenUDP fallback", err)
+		// 方案2 fallback：绑定随机端口，用 WriteToUDP 发送
+		conn2, err2 := net.ListenUDP("udp4", &net.UDPAddr{IP: nil, Port: 0})
+		if err2 != nil {
+			log.Printf("[服务发现-mDNS] ListenUDP fallback 也失败: %v", err2)
+			log.Println("[服务发现-mDNS] mDNS 完全不可用，仅靠 UDP 广播发现")
+			return
+		}
+		conn = conn2
+		log.Println("[服务发现-mDNS] 使用 ListenUDP fallback（WriteToUDP 模式）")
 	}
 	d.mdnsConn = conn
 	d.mdnsOK = true
 	d.mdnsAnnounceOnly = true
 
-	// 如果 localIP 是 nil，尝试用 conn 的本地地址
+	// 如果 localIP 是 nil，尝试用 conn 的本地地址补充
 	if d.localIP == nil {
-		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil {
+		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil && !addr.IP.IsUnspecified() {
 			d.localIP = addr.IP
+			log.Printf("[服务发现-mDNS] 从 socket 本地地址补充 IP: %s", d.localIP)
 		}
 	}
 
@@ -89,6 +98,8 @@ func (d *ServiceDiscovery) startMDNSAnnounceOnly() {
 	log.Printf("[服务发现-mDNS] 服务实例: %s", d.fqdn)
 	if d.localIP != nil {
 		log.Printf("[服务发现-mDNS] 地址: %s:%d", d.localIP, d.httpPort)
+	} else {
+		log.Println("[服务发现-mDNS] ⚠️ 本机 IP 仍为 nil，A 记录将缺失（客户端需额外解析）")
 	}
 	log.Println("[服务发现-mDNS] 主动宣告: 每 60 秒发送一次（局域网可发现）")
 
@@ -231,19 +242,32 @@ func (d *ServiceDiscovery) sendMDNSAnnouncement() {
 
 	data, err := msg.Pack()
 	if err != nil {
+		log.Printf("[服务发现-mDNS] 宣告 Pack 失败: %v", err)
 		return
 	}
 
 	// announce-only 模式：DialUDP 创建的 connected socket，用 Write 发送
 	// 完整模式：ListenMulticastUDP 创建的 unconnected socket，用 WriteToUDP 发送
+	var sent int
 	if d.mdnsAnnounceOnly {
-		if _, err := d.mdnsConn.Write(data); err != nil {
-			log.Printf("[服务发现-mDNS] 宣告发送失败: %v", err)
-		}
+		sent, err = d.mdnsConn.Write(data)
 	} else {
 		dst := &net.UDPAddr{IP: net.ParseIP(mdnsMulticastIPv4), Port: mdnsPort}
-		if _, err := d.mdnsConn.WriteToUDP(data, dst); err != nil {
-			log.Printf("[服务发现-mDNS] 宣告发送失败: %v", err)
+		sent, err = d.mdnsConn.WriteToUDP(data, dst)
+	}
+	if err != nil {
+		log.Printf("[服务发现-mDNS] 宣告发送失败: %v", err)
+	} else {
+		d.announceCnt++
+		// 首次 + 每隔 10 次输出一条调试日志，避免日志过多
+		if d.announceCnt <= 3 || d.announceCnt%10 == 0 {
+			ipStr := "nil"
+			if d.localIP != nil {
+				ipStr = d.localIP.String()
+			}
+			log.Printf("[服务发现-mDNS] 宣告 #%d 已发送 (%d bytes, IP:%s, 端口:%d, 模式:%s)",
+				d.announceCnt, sent, ipStr, d.httpPort,
+				map[bool]string{true: "仅宣告", false: "完整"}[d.mdnsAnnounceOnly])
 		}
 	}
 }

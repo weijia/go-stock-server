@@ -28,11 +28,12 @@ type ServiceDiscovery struct {
 	localIP      net.IP
 	fqdn         string
 
-	mdnsConn    *net.UDPConn
-	mdnsStop    chan struct{}
-	mdnsOK      bool
-	mdnsAnnounceOnly bool   // 仅宣告模式（无多播接收权限时）
-	queryCnt    int // 收到的查询数
+	mdnsConn          *net.UDPConn
+	mdnsStop          chan struct{}
+	mdnsOK            bool
+	mdnsAnnounceOnly  bool   // 仅宣告模式（无多播接收权限时）
+	queryCnt          int    // 收到的查询数
+	announceCnt       int    // 发送的宣告数
 
 	udpConn      *net.UDPConn
 	udpStop      chan struct{}
@@ -43,6 +44,36 @@ type ServiceDiscovery struct {
 	ipNotifyCancel func()
 
 	wg sync.WaitGroup
+}
+
+// DiscoveryStatus 服务发现状态（供 GUI / 外部查询）
+type DiscoveryStatus struct {
+	Running       bool   // mDNS 是否已启动
+	AnnounceOnly  bool   // 是否为仅宣告模式
+	LocalIP       string // 本机 IP
+	HTTPPort      int    // HTTP 端口
+	FQDN          string // mDNS 服务实例名
+	QueryCount    int    // 收到的查询数
+	AnnounceCount int    // 发送的宣告数
+	BroadcastCount int   // UDP 广播次数
+}
+
+// Status 返回当前服务发现状态快照
+func (d *ServiceDiscovery) Status() DiscoveryStatus {
+	ipStr := ""
+	if d.localIP != nil {
+		ipStr = d.localIP.String()
+	}
+	return DiscoveryStatus{
+		Running:        d.mdnsOK,
+		AnnounceOnly:   d.mdnsAnnounceOnly,
+		LocalIP:        ipStr,
+		HTTPPort:       d.httpPort,
+		FQDN:           d.fqdn,
+		QueryCount:     d.queryCnt,
+		AnnounceCount:  d.announceCnt,
+		BroadcastCount: d.broadcastCnt,
+	}
 }
 
 // NewServiceDiscovery 创建服务发现实例
@@ -59,6 +90,7 @@ func NewServiceDiscovery(httpPort int) *ServiceDiscovery {
 // Start 启动服务发现
 func (d *ServiceDiscovery) Start() {
 	d.localIP = d.findLocalIPv4()
+	log.Printf("[服务发现] 本机 IPv4 探测结果: %v", d.localIP)
 	if d.localIP == nil {
 		log.Println("[服务发现] 无法获取本机 IPv4，mDNS 降级为仅宣告模式")
 		d.fqdn = fmt.Sprintf("%s.%s.local", d.instanceName, mdnsServiceType)
