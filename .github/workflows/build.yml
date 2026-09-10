@@ -249,15 +249,19 @@ jobs:
         grep -q 'CHANGE_WIFI_MULTICAST_STATE' "$MANIFEST" || \
           sed -i 's|</manifest>|<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/><uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/><uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/><uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/></manifest>|' "$MANIFEST"
         grep -E 'uses-permission' "$MANIFEST" || true
-        java -jar /tmp/apktool.jar b -o /tmp/StockServerGUI-patched.apk /tmp/decoded
+        java -jar /tmp/apktool.jar b -o /tmp/StockServerGUI-patched-unsigned.apk /tmp/decoded
+        # 删除 apktool 残留的旧签名
+        zip -d /tmp/StockServerGUI-patched-unsigned.apk 'META-INF/*' || true
+        ZIPALIGN="${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}/zipalign"
         APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
-        ls -la "${APKSIGNER}" || (echo "apksigner not found, listing build-tools:" && ls "${ANDROID_SDK_ROOT}/build-tools/" && exit 1)
+        ls -la "${ZIPALIGN}" "${APKSIGNER}" || (echo "tools not found, listing build-tools:" && ls "${ANDROID_SDK_ROOT}/build-tools/" && exit 1)
         KEYSTORE="$HOME/.android/debug.keystore"
         if [ ! -f "$KEYSTORE" ]; then
           keytool -genkey -v -keystore "$KEYSTORE" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
         fi
         mkdir -p build-out
-        "${APKSIGNER}" sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android --out build-out/StockServerGUI-debug.apk /tmp/StockServerGUI-patched.apk
+        "${ZIPALIGN}" -f 4 /tmp/StockServerGUI-patched-unsigned.apk /tmp/StockServerGUI-aligned.apk
+        "${APKSIGNER}" sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android --out build-out/StockServerGUI-debug.apk /tmp/StockServerGUI-aligned.apk
         "${APKSIGNER}" verify --print-certs build-out/StockServerGUI-debug.apk
         ls -lh build-out/StockServerGUI-debug.apk
 
