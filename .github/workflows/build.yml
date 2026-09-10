@@ -80,7 +80,7 @@ jobs:
 
         mkdir -p build-out
 
-        LDFLAGS="-s -w -X go-stock-server/internal/core/handlers.serverVersion=$VERSION"
+        LDFLAGS="-s -w -X go-stock-server/internal/core.serverVersion=$VERSION"
 
         GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o build-out/go-stock-server-linux-amd64   ./cmd/server
 
@@ -146,7 +146,7 @@ jobs:
         echo "VERSION=$VERSION" >> $GITHUB_ENV
         echo "VERSION_CODE=${GITHUB_RUN_NUMBER}" >> $GITHUB_ENV
     - name: Build Go arm64 binary & copy to Android raw
-      run: "set -e\nmkdir -p android-app/app/src/main/res/raw build-out\nGOOS=android GOARCH=arm64 CGO_ENABLED=0 \\\n  LDFLAGS=\"-s -w -X go-stock-server/internal/core/handlers.serverVersion=$VERSION\"\nGOOS=android GOARCH=arm64 CGO_ENABLED=0 \\\n  go build -ldflags=\"$LDFLAGS\" -o build-out/go-stock-server-android-arm64 ./cmd/server\ncp build-out/go-stock-server-android-arm64 \\\n   android-app/app/src/main/res/raw/go_stock_server\nls -lh android-app/app/src/main/res/raw/go_stock_server\n"
+      run: "set -e\nmkdir -p android-app/app/src/main/res/raw build-out\nLDFLAGS=\"-s -w -X go-stock-server/internal/core.serverVersion=$VERSION\"\nGOOS=android GOARCH=arm64 CGO_ENABLED=0 \\\n  go build -ldflags=\"$LDFLAGS\" -o build-out/go-stock-server-android-arm64 ./cmd/server\ncp build-out/go-stock-server-android-arm64 \\\n   android-app/app/src/main/res/raw/go_stock_server\nls -lh android-app/app/src/main/res/raw/go_stock_server\n"
     - name: Apply CI gradle.properties (no proxy)
       run: cp android-app/gradle.properties.ci android-app/gradle.properties
     - name: Gradle assembleDebug
@@ -235,11 +235,11 @@ jobs:
         VERSION=${GITHUB_REF_NAME#v}
         echo "VERSION=$VERSION" >> $GITHUB_ENV
     - name: Ensure gui_main.go in module root
-      run: "set -e\n[ -f gui_main.go ] || cp cmd/android-gui/main.go gui_main.go\nhead -1 gui_main.go | grep -q \"^//go:build\" || \\\n  sed -i '1i //go:build android || ignore_gui_main' gui_main.go\nhead -4 gui_main.go\n"
+      run: "set -e\ncp cmd/android-gui/main.go gui_main.go\nhead -1 gui_main.go | grep -q \"^//go:build\" || \\\n  sed -i '1i //go:build android || ignore_gui_main' gui_main.go\nhead -4 gui_main.go\n"
     - name: Fyne package -os android
       env:
         ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
-      run: "set -e\nexport ANDROID_NDK_HOME=\"${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/$ANDROID_NDK_VERSION\"\n[ -d \"$ANDROID_NDK_HOME\" ] || { echo \"NDK 不存在，可用的 NDK:\"; ls \"$ANDROID_SDK_ROOT/ndk/\"; exit 1; }\nunset CGO_ENABLED\nfyne package -os android \\\n  -appID com.stock.server.gui \\\n  -name  StockServerGUI \\\n  -icon  build-out/gui_icon.png \\\n  -ldflags \"-s -w -X go-stock-server/internal/core/handlers.serverVersion=$VERSION\" \\\n  . 2>&1 | tail -40\nls -lh StockServerGUI.apk\nmkdir -p build-out\ncp StockServerGUI.apk build-out/StockServerGUI-debug.apk\n"
+      run: "set -e\nexport ANDROID_NDK_HOME=\"${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/$ANDROID_NDK_VERSION\"\n[ -d \"$ANDROID_NDK_HOME\" ] || { echo \"NDK 不存在，可用的 NDK:\"; ls \"$ANDROID_SDK_ROOT/ndk/\"; exit 1; }\nunset CGO_ENABLED\nfyne package -os android \\\n  -appID com.stock.server.gui \\\n  -name  StockServerGUI \\\n  -icon  build-out/gui_icon.png \\\n  -appVersion $VERSION \\\n  -appBuild ${GITHUB_RUN_NUMBER} \\\n  . 2>&1 | tail -40\nls -lh StockServerGUI.apk\nmkdir -p build-out\ncp StockServerGUI.apk build-out/StockServerGUI-debug.apk\n"
     - name: Upload Fyne GUI APK
       uses: actions/upload-artifact@v4
       with:

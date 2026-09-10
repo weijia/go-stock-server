@@ -62,7 +62,7 @@ func main() {
 		running: binding.NewBool(),
 	}
 	g.app.Settings().SetTheme(theme.DefaultTheme())
-	g.win = g.app.NewWindow("📈 股票行情服务器 v" + core.Version())
+	g.win = g.app.NewWindow("📈 股票行情服务器 v" + g.version())
 	g.win.Resize(fyne.NewSize(420, 720))
 	g.win.SetMaster()
 
@@ -130,7 +130,7 @@ func (g *guiApp) buildSettingsTab() *fyne.Container {
 	g.startBtn.Importance = widget.HighImportance
 	g.stopBtn  = widget.NewButtonWithIcon("■ 停止", theme.MediaStopIcon(), g.stopServer)
 	g.stopBtn.Importance = widget.DangerImportance
-	versionLbl := widget.NewLabel("版本 v" + core.Version())
+	versionLbl := widget.NewLabel("版本 v" + g.version())
 	versionLbl.TextStyle = fyne.TextStyle{Monospace: true}
 	versionLbl.Importance = widget.LowImportance
 	urlCard := widget.NewCard("浏览器 / 客户端访问", "", container.NewVBox(
@@ -236,6 +236,17 @@ func (g *guiApp) stopServer() {
 }
 
 // -------- helpers --------
+// version 优先用 Fyne 打包时注入的 app 元数据（-appVersion），
+// 开发模式（go run）下回退到 core.Version()（ldflags 注入或默认值）
+func (g *guiApp) version() string {
+	if g.app != nil {
+		if m := g.app.Metadata(); m.Version != "" && m.Version != "0.0" {
+			return m.Version
+		}
+	}
+	return core.Version()
+}
+
 func (g *guiApp) appendLog(line string) {
 	full := fmt.Sprintf("[%s] %s\n", time.Now().Format("15:04:05"), line)
 	g.logMu.Lock()

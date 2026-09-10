@@ -221,11 +221,13 @@ func (d *ServiceDiscovery) sendMDNSAnnouncement() {
 		},
 	})
 
-	// A 记录 (附加)
-	msg.Extra = append(msg.Extra, &dns.A{
-		Hdr: dns.RR_Header{Name: d.instanceName + ".local.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120},
-		A:   d.localIP,
-	})
+	// A 记录 (附加) — localIP 为 nil 时跳过（避免发送 0.0.0.0）
+	if d.localIP != nil {
+		msg.Extra = append(msg.Extra, &dns.A{
+			Hdr: dns.RR_Header{Name: d.instanceName + ".local.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120},
+			A:   d.localIP,
+		})
+	}
 
 	data, err := msg.Pack()
 	if err != nil {
