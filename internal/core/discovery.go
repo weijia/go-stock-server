@@ -177,7 +177,8 @@ func privateScore(ip net.IP) int {
 // findLocalIPv4 找本机主网卡 IPv4（启动与 IP 变化重选共用同一逻辑）
 func (d *ServiceDiscovery) findLocalIPv4() net.IP {
 	// 1) 优先用默认路由出口 IP（连 8.8.8.8 的本地地址，仅查路由表不发包）
-	if conn, err := net.Dial("udp", "8.8.8.8:80"); err == nil {
+	//    2 秒超时：Android WiFi 已连但无外网时 net.Dial 可能阻塞数十秒
+	if conn, err := net.DialTimeout("udp", "8.8.8.8:80", 2*time.Second); err == nil {
 		ip := conn.LocalAddr().(*net.UDPAddr).IP
 		conn.Close()
 		if ip4 := ip.To4(); ip4 != nil && !ip4.IsLoopback() && !isAPIPA(ip4) {
@@ -269,7 +270,7 @@ func (d *ServiceDiscovery) PrintInfo(localIP string) {
 
 // getLocalIP 获取本机 IP
 func getLocalIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
+	conn, err := net.DialTimeout("udp", "8.8.8.8:80", 2*time.Second)
 	if err != nil {
 		return "127.0.0.1"
 	}

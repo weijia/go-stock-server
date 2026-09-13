@@ -190,6 +190,8 @@ func startFromConfig(cfg ServerConfig, block bool) (*RunningServer, error) {
 	// 放到 goroutine 后 HTTP 服务可立即启动，mDNS 在后台就绪。
 	go discovery.Start()
 
+	log.Println("[启动] QuoteCache + Discovery 已初始化（discovery 后台启动中）")
+
 	handler := NewStockHandler(fetcher, tdxDS, nodeStore, quoteCache, cfg.Debug)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", handler.HandleHealth)
@@ -220,7 +222,9 @@ func startFromConfig(cfg ServerConfig, block bool) (*RunningServer, error) {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	log.Println("[启动] 路由注册完成，开始探测本机 IP...")
 	localIP := getLocalIP()
+	log.Printf("[启动] 本机 IP 探测完成: %s", localIP)
 	log.Printf("股票行情服务器启动 (Go 版) v%s", serverVersion)
 	log.Printf("  本机 IP: %s", localIP)
 	log.Printf("  HTTP 端口: %d", cfg.Port)
