@@ -175,41 +175,22 @@ func privateScore(ip net.IP) int {
 }
 
 // findLocalIPv4 找本机主网卡 IPv4（启动与 IP 变化重选共用同一逻辑）
+// 零网络IO优先：先查网卡列表，Dial 仅作 fallback（1s 超时）
 func (d *ServiceDiscovery) findLocalIPv4() net.IP {
-	// 1) 优先用默认路由出口 IP（连 8.8.8.8 的本地地址，仅查路由表不发包）
-	//    2 秒超时：Android WiFi 已连但无外网时 net.Dial 可能阻塞数十秒
-	if conn, err := net.DialTimeout("udp", "8.8.8.8:80", 2*time.Second); err == nil {
+	// 1) 先查网卡列表 — 零网络IO，不会阻塞
+	if ips := allLocalIPv4(); len(ips) > 0 {
+		sort.SliceStable(ips, func(i, j int) bool {
+			return privateScore(ips[i]) > privateScore(ips[j])
+		})
+		return ips[0]
+	}
+	// 2) fallback: Dial 8.8.8.8 查路由出口（1s 超时）
+	if conn, err := net.DialTimeout("udp", "8.8.8.8:80", 1*time.Second); err == nil {
 		ip := conn.LocalAddr().(*net.UDPAddr).IP
 		conn.Close()
 		if ip4 := ip.To4(); ip4 != nil && !ip4.IsLoopback() && !isAPIPA(ip4) {
 			return ip4
 		}
-	}
-	// 2) 兜底：收集所有非回环、非 APIPA 的 IPv4，按私有地址优先级排序取最优
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
-	var candidates []net.IP
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, _ := iface.Addrs()
-		for _, addr := range addrs {
-			if ipNet, ok := addr.(*net.IPNet); ok {
-				if ip4 := ipNet.IP.To4(); ip4 != nil && !ip4.IsLoopback() && !isAPIPA(ip4) {
-					candidates = append(candidates, ip4)
-				}
-			}
-		}
-	}
-	// 稳定排序：优先 192.168 > 10 > 172.16，其余靠后；同分保持原顺序
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return privateScore(candidates[i]) > privateScore(candidates[j])
-	})
-	if len(candidates) > 0 {
-		return candidates[0]
 	}
 	return nil
 }
@@ -268,9 +249,18 @@ func (d *ServiceDiscovery) PrintInfo(localIP string) {
 	}
 }
 
-// getLocalIP 获取本机 IP
+// getLocalIP 获取本机 IP（零网络IO优先，Dial 仅作 fallback）
 func getLocalIP() string {
-	conn, err := net.DialTimeout("udp", "8.8.8.8:80", 2*time.Second)
+	// 1) 先查网卡列表 — 零网络IO，不会阻塞
+	if ips := allLocalIPv4(); len(ips) > 0 {
+		// 按 privateScore 排序取最优
+		sort.SliceStable(ips, func(i, j int) bool {
+			return privateScore(ips[i]) > privateScore(ips[j])
+		})
+		return ips[0].String()
+	}
+	// 2) fallback: Dial 8.8.8.8 查路由出口（1s 超时）
+	conn, err := net.DialTimeout("udp", "8.8.8.8:80", 1*time.Second)
 	if err != nil {
 		return "127.0.0.1"
 	}

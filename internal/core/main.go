@@ -150,14 +150,17 @@ func StartServer(cfg ServerConfig, block bool) (*RunningServer, error) {
 // startFromConfig —— 真正的启动逻辑，与原 main() 行为 1:1
 func startFromConfig(cfg ServerConfig, block bool) (*RunningServer, error) {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+	log.Println("[启动 step 1/8] 开始初始化 StockFetcher")
 	if cfg.Debug {
 		log.Println("DEBUG 模式已启用，将显示详细请求/响应日志")
 	}
 
 	fetcher := NewStockFetcher(cfg.Debug)
+	log.Println("[启动 step 1/8] StockFetcher 完成")
 
 	var tdxDS *TdxDataSource
 	if cfg.UseTDX {
+		log.Println("[启动 step 2/8] 初始化 TDX 数据源...")
 		if cfg.TDXHost != "" {
 			tdxDS = NewTdxDataSource(false, cfg.Debug)
 			if err := tdxDS.provider.ConnectTo(cfg.TDXHost, cfg.TDXPort); err != nil {
@@ -172,26 +175,31 @@ func startFromConfig(cfg ServerConfig, block bool) (*RunningServer, error) {
 				log.Println("[TDX] ⚠️ 自动连接失败，回退到腾讯 HTTP 数据源")
 			}
 		}
+		log.Println("[启动 step 2/8] TDX 数据源完成")
+	} else {
+		log.Println("[启动 step 2/8] TDX 未启用，跳过")
 	}
 
+	log.Println("[启动 step 3/8] 初始化 NodeConfigStore")
 	nodeStore := NewNodeConfigStore(cfg.SyncInterval)
 	if cfg.SyncInterval > 0 {
 		log.Printf("配置同步间隔: 每 %d 秒自动同步", cfg.SyncInterval)
 	} else {
 		log.Println("配置同步: 已禁用")
 	}
+	log.Println("[启动 step 3/8] NodeConfigStore 完成")
 
+	log.Printf("[启动 step 4/8] 初始化 QuoteCache (dbPath=%q)", cfg.DBPath)
 	quoteCache := NewQuoteCache(cfg.DBPath)
+	log.Println("[启动 step 4/8] QuoteCache 完成")
 
+	log.Println("[启动 step 5/8] 初始化 ServiceDiscovery (后台异步)")
 	discovery := NewServiceDiscovery(cfg.Port)
 	// 非阻塞：mDNS/UDP 发现后台启动，不延迟 HTTP 服务
-	// discovery.Start() 内部有 net.Dial、ListenMulticastUDP 等网络操作，
-	// 在 Android/受限网络环境下可能阻塞数秒甚至超时，导致 GUI 的 15s 超时。
-	// 放到 goroutine 后 HTTP 服务可立即启动，mDNS 在后台就绪。
 	go discovery.Start()
+	log.Println("[启动 step 5/8] ServiceDiscovery 已提交后台启动")
 
-	log.Println("[启动] QuoteCache + Discovery 已初始化（discovery 后台启动中）")
-
+	log.Println("[启动 step 6/8] 注册 HTTP 路由")
 	handler := NewStockHandler(fetcher, tdxDS, nodeStore, quoteCache, cfg.Debug)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", handler.HandleHealth)
@@ -206,12 +214,17 @@ func startFromConfig(cfg ServerConfig, block bool) (*RunningServer, error) {
 	mux.HandleFunc("/api/minute/", handler.HandleMinute)
 	mux.HandleFunc("/api/valuation/", handler.HandleValuation)
 	mux.HandleFunc("/api/intraday/", handler.HandleIntraday)
+	log.Println("[启动 step 6/8] 路由注册完成")
 
 	var mqttClient *MQTTPriceClient
 	if cfg.EnableMQTT {
+		log.Println("[启动 step 7/8] 初始化 MQTT...")
 		mqttClient = NewMQTTClient(handler, cfg.MQTTBroker, cfg.MQTTTopic, cfg.MQTTPassword,
 			cfg.MQTTClientID, cfg.MQTTUserSuffix, cfg.MQTTPushInterval, cfg.MQTTPushOnlyTrading)
 		mqttClient.Start()
+		log.Println("[启动 step 7/8] MQTT 完成")
+	} else {
+		log.Println("[启动 step 7/8] MQTT 未启用，跳过")
 	}
 
 	httpSrv := &http.Server{
@@ -222,32 +235,23 @@ func startFromConfig(cfg ServerConfig, block bool) (*RunningServer, error) {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	log.Println("[启动] 路由注册完成，开始探测本机 IP...")
-	localIP := getLocalIP()
-	log.Printf("[启动] 本机 IP 探测完成: %s", localIP)
-	log.Printf("股票行情服务器启动 (Go 版) v%s", serverVersion)
-	log.Printf("  本机 IP: %s", localIP)
-	log.Printf("  HTTP 端口: %d", cfg.Port)
-	log.Printf("  访问地址: http://%s:%d", localIP, cfg.Port)
-	if cfg.Debug {
-		log.Println("DEBUG 模式: 已启用 (--debug)")
-	} else {
-		log.Println("DEBUG 模式: 未启用 (--debug 启用)")
-	}
-	log.Println("服务发现: mDNS/UDP 后台启动中（见后续日志）")
-	log.Println("接口列表:")
-	log.Println("  - /api/health - 健康检查")
-	log.Println("  - /api/config - 服务器配置信息")
-	log.Println("  - /api/node/config - 节点配置管理 (GET/POST/DELETE)")
-	log.Println("  - /api/realtime/<code> - 实时行情")
-	log.Println("  - /api/kline/<code>?days=30 - K线数据")
-	log.Println("  - /api/qfq/<code>?days=30 - 前复权K线")
-	log.Println("  - /api/batch/quotes?codes=000001,600000 - 批量实时行情")
-	log.Println("  - /api/quote_cache - 实时价格缓存")
-	log.Println("  - /api/name/<code> - 股票名称")
-	log.Println("  - /api/minute/<code>?period=7&minutes=300 - 分钟K线")
-	log.Println("  - /api/intraday/<code>?date=YYYYMMDD - 分时数据")
-	log.Println("  - /api/valuation/<code>?days=250 - 估值历史")
+	log.Println("[启动 step 8/8] 启动 HTTP 服务器 (ListenAndServe)")
+	// localIP 探测放到 goroutine 中，不阻塞 HTTP 启动
+	// Android 无外网时 net.Dial 可能阻塞，这里仅用于日志展示
+	go func() {
+		localIP := getLocalIP()
+		log.Printf("[启动] 本机 IP 探测完成: %s", localIP)
+		log.Printf("股票行情服务器启动 (Go 版) v%s", serverVersion)
+		log.Printf("  本机 IP: %s", localIP)
+		log.Printf("  HTTP 端口: %d", cfg.Port)
+		log.Printf("  访问地址: http://%s:%d", localIP, cfg.Port)
+		if cfg.Debug {
+			log.Println("DEBUG 模式: 已启用 (--debug)")
+		} else {
+			log.Println("DEBUG 模式: 未启用 (--debug 启用)")
+		}
+		log.Println("服务发现: mDNS/UDP 后台启动中（见后续日志）")
+	}()
 
 	go func() {
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
