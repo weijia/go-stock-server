@@ -10,6 +10,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -33,8 +34,9 @@ type guiApp struct {
 	cfg     core.ServerConfig
 	running binding.Bool
 
-	server *core.RunningServer
-	mu     sync.Mutex
+	server   *core.RunningServer
+	starting bool // 标记正在启动中，防止重复点击
+	mu       sync.Mutex
 
 	portEntry *widget.Entry
 	syncEntry *widget.Entry
@@ -246,39 +248,139 @@ func (g *guiApp) buildLogTab() *fyne.Container {
 }
 
 // -------- start/stop --------
+// startServer 将启动过程放到 goroutine 中执行。
+// 原因：core.StartServer 内部有网络操作（mDNS 绑定、IP 探测等），
+// 若直接在 GUI 事件线程同步调用会导致界面卡死；
+// 且 startServer 持有 g.mu 时调用 running.Set(true) 会触发监听器
+// 再次请求 g.mu，形成死锁。
 func (g *guiApp) startServer() {
-	g.cfg.Port = parseInt(g.portEntry.Text, 8080, 1024, 65535)
-	g.cfg.SyncInterval = parseInt(g.syncEntry.Text, 60, 0, 86400)
-	g.cfg.Host = "0.0.0.0"
-	g.cfg.DBPath = ""
-	g.mu.Lock(); defer g.mu.Unlock()
-	if g.server != nil { return }
-	g.appendLog(fmt.Sprintf("▶ 启动：端口 %d | TDX=%v | MQTT=%v | DEBUG=%v",
-		g.cfg.Port, g.cfg.UseTDX, g.cfg.EnableMQTT, g.cfg.Debug))
-	rs, err := core.StartServer(core.ServerConfig{
-		Host:         g.cfg.Host,
-		Port:         g.cfg.Port,
-		SyncInterval: g.cfg.SyncInterval,
-		UseTDX:       g.cfg.UseTDX,
-		EnableMQTT:   g.cfg.EnableMQTT,
-		Debug:        g.cfg.Debug,
-		DBPath:       g.cfg.DBPath,
-	}, false)
-	if err != nil {
-		g.appendLog("❌ 启动失败：" + err.Error())
-		dialog.ShowError(err, g.win); return
+	// 先做参数解析（在 GUI 线程，快）
+	port := parseInt(g.portEntry.Text, 8080, 1024, 65535)
+	syncInterval := parseInt(g.syncEntry.Text, 60, 0, 86400)
+	g.cfg.Port = port
+	g.cfg.SyncInterval = syncInterval
+
+	// 快速检查是否已在运行 / 正在启动（不持锁等待）
+	g.mu.Lock()
+	if g.server != nil || g.starting {
+		g.mu.Unlock()
+		return
 	}
-	g.server = rs
-	_ = g.running.Set(true)
-	g.appendLog("✅ 服务器监听 " + rs.Addr)
+	g.starting = true
+	g.mu.Unlock()
+
+	g.appendLog(fmt.Sprintf("▶ 启动：端口 %d | TDX=%v | MQTT=%v | DEBUG=%v",
+		port, g.cfg.UseTDX, g.cfg.EnableMQTT, g.cfg.Debug))
+
+	go func() {
+		// panic 恢复：任何启动阶段的意外崩溃都不能拖垮 GUI
+		defer func() {
+			if r := recover(); r != nil {
+				g.appendLog(fmt.Sprintf("❌ 启动异常（已恢复）: %v", r))
+				g.mu.Lock()
+				g.starting = false
+				g.mu.Unlock()
+				_ = g.running.Set(false)
+			}
+		}()
+
+		cfg := core.ServerConfig{
+			Host:         "0.0.0.0",
+			Port:         port,
+			SyncInterval: syncInterval,
+			UseTDX:       g.cfg.UseTDX,
+			EnableMQTT:   g.cfg.EnableMQTT,
+			Debug:        g.cfg.Debug,
+			DBPath:       "",
+		}
+
+		// 超时保护：15 秒内必须返回，否则视为启动失败
+		type result struct {
+			rs  *core.RunningServer
+			err error
+		}
+		ch := make(chan result, 1)
+		go func() {
+			rs, err := core.StartServer(cfg, false)
+			ch <- result{rs, err}
+		}()
+
+		var rs *core.RunningServer
+		var err error
+		select {
+		case res := <-ch:
+			rs, err = res.rs, res.err
+		case <-time.After(15 * time.Second):
+			err = fmt.Errorf("启动超时（15s），可能是网络/mDNS 阻塞")
+		}
+
+		if err != nil {
+			g.appendLog("❌ 启动失败：" + err.Error())
+			g.mu.Lock()
+			g.starting = false
+			g.mu.Unlock()
+			_ = g.running.Set(false)
+			dialog.ShowError(err, g.win)
+			return
+		}
+
+		// 先存 server，再设 running 状态。
+		// 关键：不能在持有 g.mu 时调用 running.Set，否则监听器会
+		// 回调 refreshMDNSStatus 再次请求 g.mu → 死锁。
+		g.mu.Lock()
+		g.server = rs
+		g.starting = false
+		g.mu.Unlock()
+
+		// 验证 HTTP 服务确实在监听（StartServer 把 ListenAndServe 放在
+		// goroutine 里，端口被占用等错误只打日志不返回，需要主动探测）。
+		healthURL := fmt.Sprintf("http://127.0.0.1:%d/api/health", port)
+		alive := false
+		for i := 0; i < 20; i++ { // 最多等 2 秒
+			hc := &http.Client{Timeout: 500 * time.Millisecond}
+			if resp, err := hc.Get(healthURL); err == nil {
+				resp.Body.Close()
+				if resp.StatusCode == 200 {
+					alive = true
+					break
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if !alive {
+			g.appendLog("❌ 服务器进程已启动但 HTTP 端口无响应（可能端口被占用）")
+			_ = rs.Stop()
+			g.mu.Lock()
+			g.server = nil
+			g.mu.Unlock()
+			_ = g.running.Set(false)
+			dialog.ShowError(fmt.Errorf("HTTP 端口 %d 无响应，可能已被占用", port), g.win)
+			return
+		}
+
+		_ = g.running.Set(true)
+		g.appendLog("✅ 服务器监听 " + rs.Addr)
+	}()
 }
+
 func (g *guiApp) stopServer() {
-	g.mu.Lock(); defer g.mu.Unlock()
-	if g.server == nil { return }
-	g.appendLog("■ 请求停止服务器...")
-	if err := g.server.Stop(); err != nil { g.appendLog("⚠️ " + err.Error()) } else { g.appendLog("✅ 已停止") }
+	g.mu.Lock()
+	if g.server == nil {
+		g.mu.Unlock()
+		return
+	}
+	rs := g.server
 	g.server = nil
+	// 先释放锁再调用 running.Set，避免监听器回调死锁
+	g.mu.Unlock()
+
+	g.appendLog("■ 请求停止服务器...")
 	_ = g.running.Set(false)
+	if err := rs.Stop(); err != nil {
+		g.appendLog("⚠️ " + err.Error())
+	} else {
+		g.appendLog("✅ 已停止")
+	}
 }
 
 // -------- helpers --------

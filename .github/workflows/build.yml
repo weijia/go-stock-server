@@ -240,16 +240,36 @@ jobs:
       env:
         ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
       run: "set -e\nexport ANDROID_NDK_HOME=\"${ANDROID_SDK_ROOT:-$ANDROID_HOME}/ndk/$ANDROID_NDK_VERSION\"\n[ -d \"$ANDROID_NDK_HOME\" ] || { echo \"NDK 不存在，可用的 NDK:\"; ls \"$ANDROID_SDK_ROOT/ndk/\"; exit 1; }\nunset CGO_ENABLED\nfyne package -os android \\\n  -appID com.stock.server.gui \\\n  -name  StockServerGUI \\\n  -icon  build-out/gui_icon.png \\\n  -appVersion $VERSION \\\n  -appBuild ${GITHUB_RUN_NUMBER} \\\n  . 2>&1 | tail -40\nls -lh StockServerGUI.apk\n"
-    - name: Inject Android permissions (CHANGE_WIFI_MULTICAST_STATE 等) via apktool
+    - name: Inject Android permissions + MulticastLock (mDNS 兼容) via apktool
       run: |
         set -ex
         wget -q -O /tmp/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
         java -jar /tmp/apktool.jar d -f -o /tmp/decoded StockServerGUI.apk
         MANIFEST=/tmp/decoded/AndroidManifest.xml
+        # 1. 注入网络权限
         grep -q 'CHANGE_WIFI_MULTICAST_STATE' "$MANIFEST" || \
           sed -i 's|</manifest>|<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/><uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/><uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/><uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/></manifest>|' "$MANIFEST"
         grep -E 'uses-permission' "$MANIFEST" || true
+        # 2. 设置自定义 Application 类（MulticastLockApp）
+        #    Android WiFi 驱动默认过滤多播包，即使有权限也必须获取 MulticastLock。
+        #    Fyne 生成的 APK 无 Kotlin 层，通过注入 Application 类在 App 启动时获取锁。
+        if ! grep -q '<application[^>]*android:name=' "$MANIFEST"; then
+          sed -i 's|<application|<application android:name="com.stock.server.gui.MulticastLockApp"|' "$MANIFEST"
+        fi
+        grep -E '<application' "$MANIFEST" || true
+        # 3. 重建 APK（含修改后的 manifest）
         java -jar /tmp/apktool.jar b -o /tmp/StockServerGUI-patched-unsigned.apk /tmp/decoded
+        # 4. 编译 MulticastLockApp.java → classes2.dex，注入到 APK
+        #    Fyne APK 只有 classes.dex，新增 classes2.dex 不会冲突
+        ANDROID_JAR="${ANDROID_SDK_ROOT}/platforms/android-${ANDROID_COMPILE_SDK}/android.jar"
+        D8="${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}/d8"
+        mkdir -p /tmp/mlock/classes
+        javac -classpath "$ANDROID_JAR" -d /tmp/mlock/classes android-gui-extras/MulticastLockApp.java
+        "$D8" --output /tmp/mlock /tmp/mlock/classes/com/stock/server/gui/MulticastLockApp.class
+        # d8 输出 /tmp/mlock/classes.dex，重命名为 classes2.dex 注入 APK
+        cp /tmp/mlock/classes.dex /tmp/mlock/classes2.dex
+        cd /tmp/mlock && zip /tmp/StockServerGUI-patched-unsigned.apk classes2.dex
+        # 5. 对齐 + 签名
         ZIPALIGN="${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}/zipalign"
         APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
         KEYSTORE="$HOME/.android/debug.keystore"
