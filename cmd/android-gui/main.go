@@ -237,12 +237,21 @@ func (g *guiApp) buildLogTab() *fyne.Container {
 	g.logView = widget.NewMultiLineEntry()
 	g.logView.SetPlaceHolder("（启动服务器后将显示运行日志...）")
 	g.logView.Wrapping = fyne.TextWrapWord
+	copyBtn := widget.NewButtonWithIcon("复制全部", theme.ContentCopyIcon(), func() {
+		g.logMu.Lock()
+		txt := g.logBuf.String()
+		g.logMu.Unlock()
+		g.app.Clipboard().SetContent(txt)
+		g.appendLog("📋 日志已复制到剪贴板")
+	})
+	clearBtn := widget.NewButton("清空", func() {
+		g.logMu.Lock(); defer g.logMu.Unlock()
+		g.logBuf.Reset(); g.logView.SetText("")
+	})
 	return container.NewBorder(
 		widget.NewLabel("服务器 & GUI 运行日志（最多保留 200KB）"),
-		widget.NewButton("清空", func() {
-			g.logMu.Lock(); defer g.logMu.Unlock()
-			g.logBuf.Reset(); g.logView.SetText("")
-		}), nil, nil,
+		container.NewGridWithColumns(2, copyBtn, clearBtn),
+		nil, nil,
 		container.NewScroll(g.logView),
 	)
 }
@@ -294,7 +303,8 @@ func (g *guiApp) startServer() {
 			DBPath:       "",
 		}
 
-		// 超时保护：15 秒内必须返回，否则视为启动失败
+		// 超时保护：30 秒安全网（discovery.Start 已改为异步，
+		// 正常情况下 StartServer 会在 1-2 秒内返回）
 		type result struct {
 			rs  *core.RunningServer
 			err error
@@ -310,8 +320,8 @@ func (g *guiApp) startServer() {
 		select {
 		case res := <-ch:
 			rs, err = res.rs, res.err
-		case <-time.After(15 * time.Second):
-			err = fmt.Errorf("启动超时（15s），可能是网络/mDNS 阻塞")
+		case <-time.After(30 * time.Second):
+			err = fmt.Errorf("启动超时（30s），请检查网络/TDX/SQLite 配置")
 		}
 
 		if err != nil {

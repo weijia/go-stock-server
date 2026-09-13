@@ -184,7 +184,11 @@ func startFromConfig(cfg ServerConfig, block bool) (*RunningServer, error) {
 	quoteCache := NewQuoteCache(cfg.DBPath)
 
 	discovery := NewServiceDiscovery(cfg.Port)
-	discovery.Start()
+	// 非阻塞：mDNS/UDP 发现后台启动，不延迟 HTTP 服务
+	// discovery.Start() 内部有 net.Dial、ListenMulticastUDP 等网络操作，
+	// 在 Android/受限网络环境下可能阻塞数秒甚至超时，导致 GUI 的 15s 超时。
+	// 放到 goroutine 后 HTTP 服务可立即启动，mDNS 在后台就绪。
+	go discovery.Start()
 
 	handler := NewStockHandler(fetcher, tdxDS, nodeStore, quoteCache, cfg.Debug)
 	mux := http.NewServeMux()
@@ -226,7 +230,7 @@ func startFromConfig(cfg ServerConfig, block bool) (*RunningServer, error) {
 	} else {
 		log.Println("DEBUG 模式: 未启用 (--debug 启用)")
 	}
-	discovery.PrintInfo(localIP)
+	log.Println("服务发现: mDNS/UDP 后台启动中（见后续日志）")
 	log.Println("接口列表:")
 	log.Println("  - /api/health - 健康检查")
 	log.Println("  - /api/config - 服务器配置信息")
