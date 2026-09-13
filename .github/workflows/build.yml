@@ -257,7 +257,20 @@ jobs:
           sed -i 's|<application|<application android:name="com.stock.server.gui.MulticastLockApp"|' "$MANIFEST"
         fi
         grep -E '<application' "$MANIFEST" || true
-        # 3. 重建 APK（含修改后的 manifest）
+        # 2.5 强制设置 versionCode / versionName
+        #     apktool decode/rebuild 会重置 versionCode 为默认值，
+        #     导致所有版本 APK versionCode 相同 → Android 拒绝覆盖安装。
+        #     同时修改 AndroidManifest.xml 和 apktool.yml。
+        VERSION_CODE="$(date +%Y%m%d%H%M)"
+        sed -i "s/android:versionCode=\"[^\"]*\"/android:versionCode=\"$VERSION_CODE\"/" "$MANIFEST"
+        sed -i "s/android:versionName=\"[^\"]*\"/android:versionName=\"$VERSION\"/" "$MANIFEST"
+        YML=/tmp/decoded/apktool.yml
+        if [ -f "$YML" ]; then
+          sed -i "s/versionCode: \"[^\"]*\"/versionCode: \"$VERSION_CODE\"/" "$YML"
+          sed -i "s/versionName: \"[^\"]*\"/versionName: \"$VERSION\"/" "$YML"
+        fi
+        echo "=== versionCode=$VERSION_CODE versionName=$VERSION ==="
+        # 3. 重建 APK（含修改后的 manifest + 正确的 versionCode）
         java -jar /tmp/apktool.jar b -o /tmp/StockServerGUI-patched-unsigned.apk /tmp/decoded
         # 4. 编译 MulticastLockApp.java → classes2.dex，注入到 APK
         #    Fyne APK 只有 classes.dex，新增 classes2.dex 不会冲突
@@ -282,6 +295,14 @@ jobs:
         "${ZIPALIGN}" -f 4 /tmp/StockServerGUI-patched-unsigned.apk /tmp/StockServerGUI-aligned.apk
         "${APKSIGNER}" sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android --out build-out/StockServerGUI-debug.apk /tmp/StockServerGUI-aligned.apk
         "${APKSIGNER}" verify --print-certs build-out/StockServerGUI-debug.apk
+        echo "=== APK 版本信息验证 ==="
+        AAPT="${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}/aapt2"
+        if [ -x "$AAPT" ]; then
+          "$AAPT" dump badging build-out/StockServerGUI-debug.apk | grep -E "package:|application-label" || true
+        else
+          AAPT="${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}/aapt"
+          [ -x "$AAPT" ] && "$AAPT" dump badging build-out/StockServerGUI-debug.apk | grep -E "package:|application-label" || true
+        fi
         ls -lh build-out/StockServerGUI-debug.apk
 
     - name: Upload Fyne GUI APK
