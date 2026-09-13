@@ -267,9 +267,10 @@ jobs:
         javac -classpath "$ANDROID_JAR" -d /tmp/mlock/classes android-gui-extras/MulticastLockApp.java
         "$D8" --output /tmp/mlock /tmp/mlock/classes/com/stock/server/gui/MulticastLockApp.class
         # d8 输出 /tmp/mlock/classes.dex，重命名为 classes2.dex 注入 APK
+        # 用子壳执行 zip，避免 cd 改变后续命令的工作目录
         cp /tmp/mlock/classes.dex /tmp/mlock/classes2.dex
-        cd /tmp/mlock && zip /tmp/StockServerGUI-patched-unsigned.apk classes2.dex
-        # 5. 对齐 + 签名
+        (cd /tmp/mlock && zip /tmp/StockServerGUI-patched-unsigned.apk classes2.dex)
+        # 5. 对齐 + 签名（工作目录回到仓库根）
         ZIPALIGN="${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}/zipalign"
         APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
         KEYSTORE="$HOME/.android/debug.keystore"
