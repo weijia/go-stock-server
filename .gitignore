@@ -11,8 +11,9 @@
 # Local gradle override
 /android-app/gradle.properties.local
 /local.properties
-/keystore.jks
-/signing.gradle
+# NOTE: debug.keystore is intentionally committed for reproducible APK signing
+# (CI runners are ephemeral; without a fixed key, each build produces a
+# differently-signed APK → "package conflicts with existing package" on update)
 
 # Go / IDE
 *.exe

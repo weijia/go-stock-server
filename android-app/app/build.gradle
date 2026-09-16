@@ -17,15 +17,25 @@ android {
         versionName = vName
         ndk { abiFilters("arm64-v8a") }
     }
+    // 固定签名配置：使用仓库内 debug.keystore，确保 CI 每次构建签名一致。
+    // 否则 ephemeral runner 每次生成不同 debug key → "软件包与现有软件包冲突"。
+    signingConfigs {
+        debug {
+            storeFile file("${rootProject.projectDir}/../debug.keystore")
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
+        }
+    }
     buildTypes {
         debug {
             minifyEnabled = false
             debuggable = true
-            signingConfig = signingConfigs.debug
+            signingConfig signingConfigs.debug
         }
         release {
             minifyEnabled = false
-            signingConfig = signingConfigs.debug
+            signingConfig signingConfigs.debug
         }
     }
     compileOptions {

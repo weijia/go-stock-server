@@ -38,6 +38,10 @@ type guiApp struct {
 	starting bool // 标记正在启动中，防止重复点击
 	mu       sync.Mutex
 
+	// 跨线程 UI 请求：goroutine 设置标志，动画定时器在 UI 线程处理
+	pendingRefresh bool   // true=需要刷新运行状态
+	pendingDialog  string // 非空=需要显示错误对话框
+
 	portEntry *widget.Entry
 	syncEntry *widget.Entry
 	swTdx     *widget.Check
@@ -88,9 +92,47 @@ func main() {
 
 	g.fetcher = core.NewStockFetcher(false)
 	g.buildTabs()
+	// 启动 UI 线程定时刷新：在 Android 上从 goroutine 调用 SetText 会死锁
+	// GL 渲染线程，导致 log 包互斥锁无法释放 → 后续所有 log.Println 调用永久
+	// 阻塞 → 启动超时 30s。
+	// 解决方案：goroutine 只写缓冲区 + 设置 pending 标志，
+	// Fyne 动画在 UI 线程上周期性检查并刷新 UI。
+	(&fyne.Animation{
+		Duration:    200 * time.Millisecond,
+		RepeatCount: fyne.AnimationRepeatForever, // 无限循环
+		Tick: func(v float32) {
+			// 1. 刷新日志
+			g.logMu.Lock()
+			txt := g.logBuf.String()
+			g.logMu.Unlock()
+			if g.logView != nil && g.logView.Text != txt {
+				g.logView.SetText(txt)
+			}
+			// 2. 处理 UI 待刷新请求（来自 goroutine 的 running.Set）
+			g.mu.Lock()
+			needRefresh := g.pendingRefresh
+			g.pendingRefresh = false
+			g.mu.Unlock()
+			if needRefresh {
+				r, _ := g.running.Get()
+				g.refreshRunState(r)
+			}
+			// 3. 处理待显示错误对话框
+			g.mu.Lock()
+			pendingDialog := g.pendingDialog
+			g.pendingDialog = ""
+			g.mu.Unlock()
+			if pendingDialog != "" {
+				dialog.ShowError(fmt.Errorf("%s", pendingDialog), g.win)
+			}
+		},
+	}).Start()
+	// running.Set 的监听器：从 goroutine 调用时不能直接刷新 UI，
+	// 设置 pendingRefresh 标志，由动画定时器在 UI 线程处理。
 	g.running.AddListener(binding.NewDataListener(func() {
-		r, _ := g.running.Get()
-		g.refreshRunState(r)
+		g.mu.Lock()
+		g.pendingRefresh = true
+		g.mu.Unlock()
 	}))
 	_ = g.running.Set(false)
 	g.win.SetCloseIntercept(func() { g.stopServer(); g.win.Close() })
@@ -109,8 +151,13 @@ func (g *guiApp) refreshRunState(r bool) {
 		g.ipLbl.SetText("")
 		g.mdnsLbl.SetText("mDNS: 未启动")
 	}
-	if r { g.startBtn.Disable(); g.stopBtn.Enable()
-	} else { g.startBtn.Enable();  g.stopBtn.Disable() }
+	if r {
+		g.startBtn.Disable()
+		g.stopBtn.Enable()
+	} else {
+		g.startBtn.Enable()
+		g.stopBtn.Disable()
+	}
 }
 
 // refreshMDNSStatus 从 RunningServer 获取 mDNS 状态并更新 UI
@@ -154,9 +201,9 @@ func (g *guiApp) buildSettingsTab() *fyne.Container {
 	g.syncEntry = widget.NewEntry()
 	g.syncEntry.SetPlaceHolder("同步间隔（秒）")
 	g.syncEntry.SetText(fmt.Sprintf("%d", g.cfg.SyncInterval))
-	g.swTdx   = widget.NewCheck("启用通达信 TCP 数据源", func(c bool) { g.cfg.UseTDX = c })
-	g.swMqtt  = widget.NewCheck("启用 MQTT 接入层",      func(c bool) { g.cfg.EnableMQTT = c })
-	g.swDebug = widget.NewCheck("DEBUG 详细日志",          func(c bool) { g.cfg.Debug = c })
+	g.swTdx = widget.NewCheck("启用通达信 TCP 数据源", func(c bool) { g.cfg.UseTDX = c })
+	g.swMqtt = widget.NewCheck("启用 MQTT 接入层", func(c bool) { g.cfg.EnableMQTT = c })
+	g.swDebug = widget.NewCheck("DEBUG 详细日志", func(c bool) { g.cfg.Debug = c })
 	g.swTdx.SetChecked(g.cfg.UseTDX)
 	g.swMqtt.SetChecked(g.cfg.EnableMQTT)
 	g.swDebug.SetChecked(g.cfg.Debug)
@@ -176,11 +223,11 @@ func (g *guiApp) buildSettingsTab() *fyne.Container {
 	g.mdnsLbl.Importance = widget.LowImportance
 	g.startBtn = widget.NewButtonWithIcon("▶ 启动服务器", theme.MediaPlayIcon(), g.startServer)
 	g.startBtn.Importance = widget.HighImportance
-	g.stopBtn  = widget.NewButtonWithIcon("■ 停止", theme.MediaStopIcon(), g.stopServer)
+	g.stopBtn = widget.NewButtonWithIcon("■ 停止", theme.MediaStopIcon(), g.stopServer)
 	g.stopBtn.Importance = widget.DangerImportance
-	versionLbl := widget.NewLabel("版本 v" + g.version())
-	versionLbl.TextStyle = fyne.TextStyle{Monospace: true}
-	versionLbl.Importance = widget.LowImportance
+	versionLbl := widget.NewLabel("📦 版本 v" + g.version())
+	versionLbl.TextStyle = fyne.TextStyle{Monospace: true, Bold: true}
+	versionLbl.Importance = widget.MediumImportance
 	urlCard := widget.NewCard("浏览器 / 客户端访问", "", container.NewVBox(
 		widget.NewLabel("同 WiFi 下访问："),
 		widget.NewLabel("健康检查：  http://<本机IP>:端口/api/health"),
@@ -206,21 +253,40 @@ func (g *guiApp) buildQuoteTab() *fyne.Container {
 	g.resultBox.Wrapping = fyne.TextWrapWord
 	rtBtn := widget.NewButton("▶ 查询单只实时", func() {
 		c := strings.TrimSpace(g.codeEntry.Text)
-		if c == "" { dialog.ShowInformation("提示", "请输入股票代码", g.win); return }
+		if c == "" {
+			dialog.ShowInformation("提示", "请输入股票代码", g.win)
+			return
+		}
 		g.appendLog(fmt.Sprintf("FetchRealtime(%s)", c))
 		r, err := g.fetcher.FetchRealtime(c)
-		if err != nil { g.resultBox.SetText("❌ " + err.Error()); return }
-		if r == nil { g.resultBox.SetText("❌ 结果为空"); return }
+		if err != nil {
+			g.resultBox.SetText("❌ " + err.Error())
+			return
+		}
+		if r == nil {
+			g.resultBox.SetText("❌ 结果为空")
+			return
+		}
 		g.resultBox.SetText(renderOne(r))
 	})
 	batchBtn := widget.NewButton("▶ 批量查询", func() {
 		raw := strings.Split(strings.ReplaceAll(g.multiEntry.Text, " ", ""), ",")
 		cs := raw[:0]
-		for _, s := range raw { if s != "" { cs = append(cs, s) } }
-		if len(cs) == 0 { dialog.ShowInformation("提示", "请输入至少 1 个代码", g.win); return }
+		for _, s := range raw {
+			if s != "" {
+				cs = append(cs, s)
+			}
+		}
+		if len(cs) == 0 {
+			dialog.ShowInformation("提示", "请输入至少 1 个代码", g.win)
+			return
+		}
 		g.appendLog(fmt.Sprintf("FetchBatchQuotes(%d codes)", len(cs)))
 		m, err := g.fetcher.FetchBatchQuotes(cs)
-		if err != nil { g.resultBox.SetText("❌ " + err.Error()); return }
+		if err != nil {
+			g.resultBox.SetText("❌ " + err.Error())
+			return
+		}
 		g.resultBox.SetText(renderMany(m))
 	})
 	clearBtn := widget.NewButton("清空结果", func() { g.resultBox.SetText("") })
@@ -245,8 +311,10 @@ func (g *guiApp) buildLogTab() *fyne.Container {
 		g.appendLog("📋 日志已复制到剪贴板")
 	})
 	clearBtn := widget.NewButton("清空", func() {
-		g.logMu.Lock(); defer g.logMu.Unlock()
-		g.logBuf.Reset(); g.logView.SetText("")
+		g.logMu.Lock()
+		defer g.logMu.Unlock()
+		g.logBuf.Reset()
+		g.logView.SetText("")
 	})
 	return container.NewBorder(
 		widget.NewLabel("服务器 & GUI 运行日志（最多保留 200KB）"),
@@ -280,6 +348,7 @@ func (g *guiApp) startServer() {
 
 	g.appendLog(fmt.Sprintf("▶ 启动：端口 %d | TDX=%v | MQTT=%v | DEBUG=%v",
 		port, g.cfg.UseTDX, g.cfg.EnableMQTT, g.cfg.Debug))
+	g.appendLog(fmt.Sprintf("📦 当前版本: v%s", g.version()))
 
 	go func() {
 		// panic 恢复：任何启动阶段的意外崩溃都不能拖垮 GUI
@@ -315,22 +384,34 @@ func (g *guiApp) startServer() {
 			ch <- result{rs, err}
 		}()
 
+		// 启动进度心跳：每 3 秒输出一条日志，让用户知道 GUI 仍在等待
+		// （正常启动 <2s，若看到心跳说明有步骤卡住）
+		heartbeat := time.NewTicker(3 * time.Second)
+		defer heartbeat.Stop()
+
 		var rs *core.RunningServer
 		var err error
-		select {
-		case res := <-ch:
-			rs, err = res.rs, res.err
-		case <-time.After(30 * time.Second):
-			err = fmt.Errorf("启动超时（30s），请检查网络/TDX/SQLite 配置")
+	waitLoop:
+		for {
+			select {
+			case res := <-ch:
+				rs, err = res.rs, res.err
+				break waitLoop
+			case <-heartbeat.C:
+				g.appendLog("⏳ 启动中... 若持续无响应请查看「日志」Tab 的 step 输出")
+			case <-time.After(30 * time.Second):
+				err = fmt.Errorf("启动超时（30s）。请检查：1) 日志 Tab 的 step 进度定位卡在哪一步；2) 网络/TDX/SQLite 配置；3) 是否安装了最新版本（旧版存在启动阻塞 bug）")
+				break waitLoop
+			}
 		}
 
 		if err != nil {
 			g.appendLog("❌ 启动失败：" + err.Error())
 			g.mu.Lock()
 			g.starting = false
+			g.pendingDialog = err.Error()
 			g.mu.Unlock()
 			_ = g.running.Set(false)
-			dialog.ShowError(err, g.win)
 			return
 		}
 
@@ -362,9 +443,9 @@ func (g *guiApp) startServer() {
 			_ = rs.Stop()
 			g.mu.Lock()
 			g.server = nil
+			g.pendingDialog = fmt.Sprintf("HTTP 端口 %d 无响应，可能已被占用", port)
 			g.mu.Unlock()
 			_ = g.running.Set(false)
-			dialog.ShowError(fmt.Errorf("HTTP 端口 %d 无响应，可能已被占用", port), g.win)
 			return
 		}
 
@@ -399,6 +480,9 @@ func (g *guiApp) stopServer() {
 func (g *guiApp) version() string {
 	if g.app != nil {
 		if m := g.app.Metadata(); m.Version != "" && m.Version != "0.0" {
+			if m.Build > 0 {
+				return fmt.Sprintf("%s (build %d)", m.Version, m.Build)
+			}
 			return m.Version
 		}
 	}
@@ -410,26 +494,32 @@ func (g *guiApp) appendLog(line string) {
 	g.logMu.Lock()
 	g.logBuf.WriteString(full)
 	if g.logBuf.Len() > 200*1024 {
-		s := g.logBuf.String(); g.logBuf.Reset(); g.logBuf.WriteString(s[len(s)/2:])
+		s := g.logBuf.String()
+		g.logBuf.Reset()
+		g.logBuf.WriteString(s[len(s)/2:])
 	}
-	txt := g.logBuf.String()
 	g.logMu.Unlock()
-	// Fyne v2 标准：用 QueueUpdate（app 对象有 Queue 能力）避免跨线程刷新
-	if q, ok := interface{}(g.app).(interface{ QueueUpdate(func()) }); ok {
-		q.QueueUpdate(func() { g.logView.SetText(txt) })
-	} else {
-		g.logView.SetText(txt)
-	}
+	// 不在此处直接更新 UI！
+	// Android 上 fyne.App 不实现 QueueUpdate，从 goroutine 调用 SetText
+	// 会与 GL 渲染线程死锁，导致 log 包互斥锁无法释放 → 后续所有
+	// log.Println 调用永久阻塞 → 启动超时 30s。
+	// 改为：动画定时器在 UI 线程上周期性读取 logBuf 并刷新 logView。
 }
 
 func parseInt(s string, def, lo, hi int) int {
 	s = strings.TrimSpace(s)
-	if s == "" { return def }
+	if s == "" {
+		return def
+	}
 	var n int
-	if _, err := fmt.Sscanf(s, "%d", &n); err != nil { return def }
+	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
+		return def
+	}
 	switch {
-	case n < lo: return lo
-	case n > hi: return hi
+	case n < lo:
+		return lo
+	case n > hi:
+		return hi
 	}
 	return n
 }
@@ -442,7 +532,10 @@ func renderOne(r *core.RealtimeQuote) string {
 	fmt.Fprintf(&b, "  最高  %7.3f      最低 %7.3f\n", r.High, r.Low)
 	chg := r.ChangeAmt
 	pct := r.ChangePct
-	sign := ""; if chg > 0 { sign = "+" }
+	sign := ""
+	if chg > 0 {
+		sign = "+"
+	}
 	fmt.Fprintf(&b, "  涨跌 %s%7.3f  (%s%6.2f%%)\n", sign, chg, sign, pct)
 	fmt.Fprintf(&b, "  成交量 %8.0f 手      成交额 %.0f 元\n", r.Volume/100, r.Amount)
 	fmt.Fprintf(&b, "  数据源：%s", "腾讯 HTTP / 缓存（core.RealtimeData）")
@@ -450,10 +543,19 @@ func renderOne(r *core.RealtimeQuote) string {
 }
 
 func renderMany(m map[string]*core.BatchQuoteRecord) string {
-	if len(m) == 0 { return "空结果" }
-	type row struct{ k string; r *core.BatchQuoteRecord }
+	if len(m) == 0 {
+		return "空结果"
+	}
+	type row struct {
+		k string
+		r *core.BatchQuoteRecord
+	}
 	rows := make([]row, 0, len(m))
-	for k, v := range m { if v != nil { rows = append(rows, row{k, v}) } }
+	for k, v := range m {
+		if v != nil {
+			rows = append(rows, row{k, v})
+		}
+	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].k < rows[j].k })
 	var b strings.Builder
 	fmt.Fprintf(&b, "%-8s %-10s %10s %10s %10s %12s\n",
@@ -463,13 +565,26 @@ func renderMany(m map[string]*core.BatchQuoteRecord) string {
 		r := rr.r
 		last := r.PrevClose
 		chg := r.Price - last
-		pct := 0.0; if last > 0 { pct = chg / last * 100 }
-		sign := ""; if chg > 0 { sign = "+" }
+		pct := 0.0
+		if last > 0 {
+			pct = chg / last * 100
+		}
+		sign := ""
+		if chg > 0 {
+			sign = "+"
+		}
 		fmt.Fprintf(&b, "%-8s %-10s %10.3f %s%9.3f %s%8.2f%% %12.0f\n",
 			r.Code, truncate(r.Name, 8), r.Price, sign, chg, sign, pct, r.Volume/100)
-		if r.Stale { b.WriteString("     ⚠️ stale\n") }
+		if r.Stale {
+			b.WriteString("     ⚠️ stale\n")
+		}
 	}
 	return b.String()
 }
 func truncate(s string, n int) string {
-	r := []rune(s); if len(r) <= n { return s }; return string(r[:n]) + "…" }
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
