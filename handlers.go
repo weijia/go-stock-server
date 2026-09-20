@@ -354,9 +354,11 @@ func (h *StockHandler) HandleKline(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 通达信优先 → 腾讯 HTTP 回退
+	// 通达信优先 → 多源 HTTP 回退
 	var data *KlineResponse
 	var err error
+	var src string
+	var stale bool
 
 	if h.tdx != nil && h.tdx.Enabled() {
 		data, err = h.tdx.GetKline(code, days)
@@ -366,7 +368,7 @@ func (h *StockHandler) HandleKline(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if data == nil || err != nil {
-		data, err = h.fetcher.FetchKline(code, days)
+		data, src, stale, err = h.fetcher.FetchKline(code, days)
 	}
 
 	if err != nil || data == nil || data.Count == 0 {
@@ -380,7 +382,8 @@ func (h *StockHandler) HandleKline(w http.ResponseWriter, r *http.Request) {
 	h.sendJSON(w, 200, map[string]interface{}{
 		"code":      200,
 		"data":      data,
-		"stale":     false,
+		"stale":     stale,
+		"source":    src,
 		"price_ts":  time.Now().Format(time.RFC3339),
 		"timestamp": time.Now().Format(time.RFC3339),
 	})
@@ -549,7 +552,10 @@ func (h *StockHandler) HandleQfq(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stale := false
-	resp, source, unadjusted, err := h.fetcher.FetchQfq(code, days)
+	resp, source, unadjusted, fetchedStale, err := h.fetcher.FetchQfq(code, days)
+	if fetchedStale {
+		stale = true
+	}
 	if err != nil || resp == nil || resp.Count == 0 {
 		// 腾讯 HTTP 失败 → TDX 未复权日 K 兜底（对齐 Python 主链第三层：
 		// 网络源失败 → 本地 TDX 前复权 → 未复权兜底并标记 unadjusted）。
@@ -559,6 +565,7 @@ func (h *StockHandler) HandleQfq(w http.ResponseWriter, r *http.Request) {
 				resp = tdxResp
 				source = "通达信TCP(未复权)"
 				unadjusted = true
+				stale = false
 				err = nil
 			}
 		}
@@ -677,6 +684,23 @@ func (h *StockHandler) ensureTodayOpen(resp *KlineResponse, code string) *KlineR
 				})
 				resp.Count = len(resp.Data)
 			}
+		}
+	}
+	// TDX 未启用/失败 → 用实时行情（qt.gtimg.cn，本环境可达）补今日根，
+	// 避免盘中末根停在昨天（对齐 Python ensure_today_open 的「补今日根」目的，
+	// 数据源由 TDX 改为实时行情，因本 server TDX 未启用）。
+	if rt, rErr := h.fetcher.FetchRealtime(code); rErr == nil && rt != nil {
+		last := resp.Data[len(resp.Data)-1]
+		if last.Date < today {
+			resp.Data = append(resp.Data, KlineRecord{
+				Date:   today,
+				Open:   rt.Open,
+				Close:  rt.Price,
+				High:   rt.High,
+				Low:    rt.Low,
+				Volume: rt.Volume,
+			})
+			resp.Count = len(resp.Data)
 		}
 	}
 	return resp

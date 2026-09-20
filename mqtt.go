@@ -176,7 +176,7 @@ func (ch *mqttCommandHandler) kline(data map[string]interface{}) map[string]inte
 		return errResp("kline", "缺少 code")
 	}
 	days := intval(data["days"], 30)
-	resp, err := ch.h.fetcher.FetchKline(code, days)
+	resp, src, stale, err := ch.h.fetcher.FetchKline(code, days)
 	if err != nil || resp == nil || resp.Count == 0 {
 		return errResp("kline", fmt.Sprintf("无可用数据源: %v", err), code)
 	}
@@ -185,7 +185,8 @@ func (ch *mqttCommandHandler) kline(data map[string]interface{}) map[string]inte
 		"name":    resp.Name,
 		"count":   resp.Count,
 		"data":    resp.Data,
-		"stale":   false,
+		"stale":   stale,
+		"source":  src,
 		"price_ts": time.Now().Format(time.RFC3339),
 	}, code)
 }
@@ -196,7 +197,7 @@ func (ch *mqttCommandHandler) qfq(data map[string]interface{}) map[string]interf
 		return errResp("qfq", "缺少 code")
 	}
 	days := intval(data["days"], 30)
-	resp, source, unadjusted, err := ch.h.fetcher.FetchQfq(code, days)
+	resp, source, unadjusted, stale, err := ch.h.fetcher.FetchQfq(code, days)
 	if err != nil || resp == nil || resp.Count == 0 {
 		return errResp("qfq", fmt.Sprintf("无可用数据源: %v", err), code)
 	}
@@ -206,7 +207,7 @@ func (ch *mqttCommandHandler) qfq(data map[string]interface{}) map[string]interf
 		"name":       resp.Name,
 		"count":      resp.Count,
 		"data":       resp.Data,
-		"stale":      false,
+		"stale":      stale,
 		"price_ts":   time.Now().Format(time.RFC3339),
 		"source":     source,
 		"unadjusted": unadjusted,

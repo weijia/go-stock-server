@@ -3,6 +3,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,18 +21,21 @@ import (
 
 // StockFetcher 股票数据获取器
 type StockFetcher struct {
-	client    *http.Client
-	debug     bool
-	nameCache map[string]string
-	mu        sync.RWMutex
+	client     *http.Client
+	debug      bool
+	nameCache  map[string]string
+	mu         sync.RWMutex
+	klineCache map[string]klineCacheEntry
+	klineMu    sync.RWMutex
 }
 
 // NewStockFetcher 创建数据获取器
 func NewStockFetcher(debug bool) *StockFetcher {
 	return &StockFetcher{
-		client:    &http.Client{Timeout: 15 * time.Second},
-		debug:     debug,
-		nameCache: make(map[string]string),
+		client:     &http.Client{Timeout: 15 * time.Second},
+		debug:      debug,
+		nameCache:  make(map[string]string),
+		klineCache: make(map[string]klineCacheEntry),
 	}
 }
 
@@ -96,17 +100,83 @@ func (f *StockFetcher) FetchRealtime(code string) (*RealtimeData, error) {
 	return f.parseRealtime(body, code)
 }
 
-// FetchKline 获取K线数据
-func (f *StockFetcher) FetchKline(code string, days int) (*KlineResponse, error) {
+// K 线缓存（对齐 Python _kline_cache）：新鲜期内直接返回；全部源失败回退 stale TTL 内旧值。
+const (
+	klineCacheFreshTTL = 60  // 秒：新鲜期，命中即返回不回源
+	klineCacheStaleTTL = 600 // 秒：全部源失败时回退此期内的旧值（对齐 Python _cache_stale_ttl）
+)
+
+type klineCacheEntry struct {
+	ts   int64
+	resp *KlineResponse
+}
+
+// FetchKline 获取K线数据（多源兜底，对齐 Python fetch_kline_qfq 主链）。
+//
+// 优先级：① 缓存新鲜命中 → ② 网络源 腾讯A股 → 新浪A股 → 东财A股（任一成功即用）
+// → ③ 全部源失败回退 stale TTL 内旧缓存（标记 stale）。港股走腾讯当日快照单源。
+//
+// 之所以多源：线上曾出现腾讯 web.ifzq.gtimg.cn fqkline 被 WAF 拦截（HTTP 501 HTML），
+// 单源时直接 503；新浪/东财为不同域名，可绕过该拦截（对齐 Python 多网络源策略）。
+func (f *StockFetcher) FetchKline(code string, days int) (*KlineResponse, string, bool, error) {
 	// 港股：腾讯 fqkline 接口不提供前复权历史（无 qfqday 字段），
 	// 与 Python _qfq_from_hk_tencent 一致改走当日快照构造 1 行未复权数据。
 	if isHKCode(code) {
-		return f.fetchHKKline(code)
+		resp, err := f.fetchHKKline(code)
+		return resp, "腾讯HTTP(港股快照)", false, err
 	}
+
+	cacheKey := fmt.Sprintf("%s:%d", code, days)
+	now := time.Now().Unix()
+
+	// ① 新鲜缓存命中
+	if cached, ok := f.klineCacheGet(cacheKey); ok && now-cached.ts < klineCacheFreshTTL {
+		return cached.resp, "缓存", false, nil
+	}
+
 	prefix := marketPrefix(code)
 	sym := apiCode(code)
-	url := fmt.Sprintf("http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s%s,day,,,%d,qfq", prefix, sym, days)
+	sources := []struct {
+		name  string
+		fetch func() (*KlineResponse, error)
+	}{
+		{"腾讯A股", func() (*KlineResponse, error) { return f.fetchKlineTencent(prefix, sym, days) }},
+		{"新浪A股", func() (*KlineResponse, error) { return f.fetchKlineSina(code, days) }},
+		{"东财A股", func() (*KlineResponse, error) { return f.fetchKlineEastMoney(code, days) }},
+	}
 
+	var lastErr error
+	for _, s := range sources {
+		resp, err := s.fetch()
+		if err == nil && resp != nil && resp.Count > 0 {
+			f.klineCacheSet(cacheKey, resp)
+			f.setNameCache(code, resp.Name)
+			return resp, s.name, false, nil
+		}
+		if err != nil {
+			lastErr = err
+			log.Printf("[KLINE] %s 失败 [%s]: %v", s.name, code, err)
+		}
+	}
+
+	// ③ 全部源失败 → 回退 stale TTL 内旧缓存（对齐 Python 600s 陈旧兜底，标记 stale）
+	if cached, ok := f.klineCacheGet(cacheKey); ok && now-cached.ts < klineCacheStaleTTL {
+		log.Printf("[KLINE] 全部源失败，回退 %ds 内缓存(陈旧) [%s]", int(now-cached.ts), code)
+		return cached.resp, "缓存(陈旧)", true, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("K线数据获取失败")
+	}
+	return nil, "", false, lastErr
+}
+
+// fetchKlineTencent 腾讯 fqkline（原单源逻辑，含 data:[] 节流退避重试）。
+func (f *StockFetcher) fetchKlineTencent(prefix, sym string, days int) (*KlineResponse, error) {
+	code := prefix + sym
+	// 注意：线上 `web.ifzq.gtimg.cn` 该接口被 WAF 拦截（HTTP 501），改用未被拦的
+	// `ifzq.gtimg.cn`（同份 qfq 数据，且支持 ETF/指数），对齐 Python 腾讯子源可用性。
+	url := fmt.Sprintf("https://ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s%s,day,,,%d,qfq", prefix, sym, days)
+	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		body, err := f.httpGet(url)
 		if err != nil {
@@ -116,15 +186,173 @@ func (f *StockFetcher) FetchKline(code string, days int) (*KlineResponse, error)
 		if err == nil {
 			return resp, nil
 		}
-		// 腾讯对连续/高频请求（如批量拉 K 线）会间歇返回 data:[] 做节流，
-		// 退避重试自愈（400ms→800ms）；无效代码重试后仍返回同错，不影响。
+		lastErr = err
+		// 腾讯对连续/高频请求间歇返回 data:[] 做节流，退避重试自愈（400ms→800ms）。
 		if strings.Contains(err.Error(), "K线数据未找到") && attempt < 2 {
 			time.Sleep(400 * time.Millisecond * time.Duration(1<<uint(attempt)))
 			continue
 		}
 		return nil, err
 	}
-	return nil, fmt.Errorf("K线数据获取失败")
+	if lastErr == nil {
+		lastErr = fmt.Errorf("K线数据获取失败")
+	}
+	return nil, lastErr
+}
+
+// fetchKlineSina 新浪 A股前复权日 K（money.finance.sina.com.cn，独立于腾讯域名，
+// 用于绕过腾讯 fqkline 被 WAF 拦截的场景，对齐 Python 新浪A股源）。
+func (f *StockFetcher) fetchKlineSina(code string, days int) (*KlineResponse, error) {
+	prefix := marketPrefix(code)
+	sym := apiCode(code)
+	// quotes.sina.cn 对 A股/ETF 均可用；money.finance.sina.com.cn 对 ETF 返回 456，故用前者。
+	url := fmt.Sprintf("https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketData.getKLineData?symbol=%s%s&scale=240&ma=no&datalen=%d", prefix, sym, days)
+	body, err := f.httpGetWithHeaders(url, map[string]string{
+		"Referer": "https://finance.sina.com.cn/",
+	}, 8*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("新浪K线请求失败: %w", err)
+	}
+	return f.parseKlineSina(body, code, days)
+}
+
+func (f *StockFetcher) parseKlineSina(content, code string, days int) (*KlineResponse, error) {
+	var rows []struct {
+		Day    string `json:"day"`
+		Open   string `json:"open"`
+		High   string `json:"high"`
+		Low    string `json:"low"`
+		Close  string `json:"close"`
+		Volume string `json:"volume"`
+	}
+	if err := json.Unmarshal([]byte(content), &rows); err != nil {
+		return nil, fmt.Errorf("新浪K线解析失败: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("新浪K线数据未找到 %s", code)
+	}
+	records := make([]KlineRecord, 0, len(rows))
+	for _, r := range rows {
+		date := r.Day
+		if i := strings.Index(date, " "); i >= 0 {
+			date = date[:i]
+		}
+		records = append(records, KlineRecord{
+			Date:   date,
+			Open:   parseFloatSafe(r.Open),
+			Close:  parseFloatSafe(r.Close),
+			High:   parseFloatSafe(r.High),
+			Low:    parseFloatSafe(r.Low),
+			Volume: parseFloatSafe(r.Volume),
+		})
+	}
+	if len(records) > days {
+		records = records[len(records)-days:]
+	}
+	return &KlineResponse{Code: code, Name: f.getNameCache(code), Count: len(records), Data: records}, nil
+}
+
+// fetchKlineEastMoney 东方财富 K 线（push2his.eastmoney.com，独立于腾讯域名）。
+// 本环境东财 https 可能被掐，作为额外兜底；失败不影响腾讯/新浪主源。
+func (f *StockFetcher) fetchKlineEastMoney(code string, days int) (*KlineResponse, error) {
+	secid := emSecid(code)
+	// klt=101 日线；fqt=1 前复权（对齐 qfq 契约）；fields2 取 日期/开/收/高/低/量。
+	// 注：本网络 push2his 常被掐，仅作可达时的额外兜底。
+	url := fmt.Sprintf("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&klt=101&fqt=1&forcect=1&beg=0&end=20500101", secid)
+	body, err := f.httpGetWithHeaders(url, map[string]string{
+		"Referer": "https://fund.eastmoney.com/",
+	}, 8*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("东财K线请求失败: %w", err)
+	}
+	return f.parseKlineEastMoney(body, code, days)
+}
+
+func (f *StockFetcher) parseKlineEastMoney(content, code string, days int) (*KlineResponse, error) {
+	var root struct {
+		Data *struct {
+			Klines []string `json:"klines"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(content), &root); err != nil {
+		return nil, fmt.Errorf("东财K线解析失败: %w", err)
+	}
+	if root.Data == nil || len(root.Data.Klines) == 0 {
+		return nil, fmt.Errorf("东财K线数据未找到 %s", code)
+	}
+	records := make([]KlineRecord, 0, len(root.Data.Klines))
+	for _, kl := range root.Data.Klines {
+		parts := strings.Split(kl, ",")
+		if len(parts) < 6 {
+			continue
+		}
+		records = append(records, KlineRecord{
+			Date:   parts[0],
+			Open:   parseFloatSafe(parts[1]),
+			Close:  parseFloatSafe(parts[2]),
+			High:   parseFloatSafe(parts[3]),
+			Low:    parseFloatSafe(parts[4]),
+			Volume: parseFloatSafe(parts[5]),
+		})
+	}
+	if len(records) == 0 {
+		return nil, fmt.Errorf("东财K线解析为空 %s", code)
+	}
+	if len(records) > days {
+		records = records[len(records)-days:]
+	}
+	return &KlineResponse{Code: code, Name: f.getNameCache(code), Count: len(records), Data: records}, nil
+}
+
+// emSecid 东财 secid：沪市 1.xxxxxx，深市 0.xxxxxx。
+func emSecid(code string) string {
+	c := strings.TrimSpace(code)
+	if strings.HasPrefix(c, "6") || strings.HasPrefix(c, "5") || strings.HasPrefix(c, "9") {
+		return "1." + c
+	}
+	return "0." + c
+}
+
+// httpGetWithHeaders 带自定义请求头与超时的 GET（供新浪/东财等非腾讯源使用）。
+func (f *StockFetcher) httpGetWithHeaders(rawURL string, headers map[string]string, timeout time.Duration) (string, error) {
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
+// klineCacheGet / klineCacheSet 进程内 K 线缓存（读写分离锁）。
+func (f *StockFetcher) klineCacheGet(key string) (klineCacheEntry, bool) {
+	f.klineMu.RLock()
+	defer f.klineMu.RUnlock()
+	e, ok := f.klineCache[key]
+	return e, ok
+}
+
+func (f *StockFetcher) klineCacheSet(key string, resp *KlineResponse) {
+	f.klineMu.Lock()
+	defer f.klineMu.Unlock()
+	f.klineCache[key] = klineCacheEntry{ts: time.Now().Unix(), resp: resp}
 }
 
 // fetchHKKline 港股 K 线：腾讯当日快照（qt.gtimg.cn/q=hkXXXXX）构造 1 行未复权数据。
@@ -751,19 +979,15 @@ func (f *StockFetcher) parseBatchQuotes(content string, codes []string) (map[str
 	return result, nil
 }
 
-// FetchQfq 前复权日 K 线（腾讯 HTTP，qfq 参数）。
-// 返回 K线响应、数据源标识、是否未复权兜底、错误。
-func (f *StockFetcher) FetchQfq(code string, days int) (*KlineResponse, string, bool, error) {
-	source := "腾讯A股"
-	if isHKCode(code) {
-		source = "腾讯HTTP(港股快照)"
-	}
-	resp, err := f.FetchKline(code, days)
+// FetchQfq 前复权日 K 线（多源，对齐 Python fetch_kline_qfq）。
+// 返回 K线响应、数据源标识、是否未复权兜底、是否陈旧缓存、错误。
+func (f *StockFetcher) FetchQfq(code string, days int) (*KlineResponse, string, bool, bool, error) {
+	resp, source, stale, err := f.FetchKline(code, days)
 	if err != nil {
-		return nil, "", false, err
+		return nil, "", false, stale, err
 	}
 	if resp == nil || resp.Count == 0 {
-		return nil, "", false, fmt.Errorf("前复权K线无数据 [%s]", code)
+		return nil, "", false, stale, fmt.Errorf("前复权K线无数据 [%s]", code)
 	}
-	return resp, source, false, nil
+	return resp, source, false, stale, nil
 }
