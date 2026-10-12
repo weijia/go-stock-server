@@ -1,0 +1,10 @@
+<resources>
+    <color name="primary">#1976D2</color>
+    <color name="primary_dark">#0D47A1</color>
+    <color name="accent">#FF6F00</color>
+    <color name="bg">#FAFAFA</color>
+    <color name="text_on_primary">#FFFFFF</color>
+    <color name="ok">#2E7D32</color>
+    <color name="warn">#E65100</color>
+    <color name="err">#C62828</color>
+</resources>

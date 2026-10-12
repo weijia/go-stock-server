@@ -1,0 +1,23 @@
+<resources>
+    <string name="app_name">股票行情服务器</string>
+    <string name="channel_name">行情服务器通知栏</string>
+    <string name="channel_desc">服务器运行状态通知</string>
+    <string name="notify_running">⚡ 行情服务器运行中</string>
+    <string name="notify_stopped">服务器已停止</string>
+    <string name="btn_start">▶ 启动服务器</string>
+    <string name="btn_stop">■ 停止服务器</string>
+    <string name="hint_port">HTTP 端口（默认 8080）</string>
+    <string name="hint_sync_interval">节点配置同步秒数（默认 60）</string>
+    <string name="switch_tdx">启用通达信 TCP 数据源</string>
+    <string name="switch_debug">DEBUG 详细日志</string>
+    <string name="switch_mqtt">启用 MQTT 接入层</string>
+    <string name="switch_autostart">开机自动启动</string>
+    <string name="label_local_ip">本机 IP</string>
+    <string name="label_access_url">浏览器访问地址</string>
+    <string name="label_run_status">运行状态：停止</string>
+    <string name="label_run_status_running">运行状态：✅ 运行中 端口 %d</string>
+    <string name="action_open_browser">🌐 在浏览器打开</string>
+    <string name="action_share">分享访问 URL</string>
+    <string name="action_battery">🔋 请求忽略电池优化（保活）</string>
+    <string name="toast_no_ip">未检测到 WiFi IP，请连接 WiFi</string>
+</resources>
