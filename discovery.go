@@ -54,6 +54,11 @@ type ServiceDiscovery struct {
 	// discoveryStop 整个发现生命周期的停止信号（watchIPChange / selfHealLoop 常驻）。
 	discoveryStop chan struct{}
 
+	// registrar 外部 mDNS 注册器（方案 A）。非 nil 时优先用外部 registrar
+	// 注册（典型场景：Android 端注入的 NsdManager 包装），跳过内置 socket 版本。
+	// PC 平台默认为 nil，自动回退到 discovery_mdns.go / discovery_windows.go 的 startMDNS。
+	registrar MDNSRegistrar
+
 	wg sync.WaitGroup
 }
 
@@ -79,7 +84,13 @@ func (d *ServiceDiscovery) Start() {
 	d.fqdn = fmt.Sprintf("%s.%s.local", d.instanceName, mdnsServiceType)
 
 	d.discoveryStop = make(chan struct{})
-	d.startMDNS()
+
+	// 优先用外部 mDNS registrar（方案 A：Android NsdManager 注入实现）；
+	// 注册失败或未注入时回退到内置 socket 实现（PC 平台）。
+	if !d.tryExternalMDNS() {
+		d.startMDNS()
+	}
+
 	go d.udpBroadcastLoop()
 	// 事件驱动监听本机 IP 变化（换网/拔插网卡后客户端仍能发现），IP 一变即重建 mDNS
 	go d.watchIPChange()
@@ -112,7 +123,17 @@ func (d *ServiceDiscovery) onIPChanged(newIP net.IP) {
 // restartMDNS 停止并重新启动 mDNS（IP 变化后调用）。注意：仅重建 mDNS socket/协程，
 // 不再重启 watchIPChange（其在本进程生命周期内常驻于 discoveryStop），避免重复注册
 // 导致 IP 监听句柄被旧协程的 defer 清掉而泄漏/失效。
+//
+// 若已注入外部 registrar（Android NsdManager），改走 Unregister + Register；
+// NsdManager 通常自身能感知 IP 变化，但显式重注册更稳妥。
 func (d *ServiceDiscovery) restartMDNS() {
+	if d.unregisterExternalMDNS() {
+		// 外部 registrar 已注销，重新注册；失败回退到内置 socket 实现
+		if !d.tryExternalMDNS() {
+			d.startMDNS()
+		}
+		return
+	}
 	d.stopMDNS()
 	d.mdnsStop = make(chan struct{})
 	d.startMDNS()
@@ -131,7 +152,13 @@ func (d *ServiceDiscovery) Stop() {
 		d.ipNotifyCancel()
 		d.ipNotifyCancel = nil
 	}
-	d.stopMDNS()
+
+	// 优先注销外部 registrar（Android NsdManager）；无外部 registrar 或注销失败时
+	// 回退到内置 socket 关闭。
+	if !d.unregisterExternalMDNS() {
+		d.stopMDNS()
+	}
+
 	if d.udpConn != nil {
 		close(d.udpStop)
 		d.udpConn.Close()
@@ -267,9 +294,15 @@ func (d *ServiceDiscovery) sendUDPBroadcast() {
 // PrintInfo 打印服务发现信息
 func (d *ServiceDiscovery) PrintInfo(localIP string) {
 	if d.mdnsOK {
-		log.Printf("服务发现: mDNS (%s)", d.fqdn)
-		log.Println("  Android NSD / iOS Bonjour 搜索: _stock-server._tcp")
-		log.Printf("  主动宣告: 每 %d 秒发送一次（mDNS 规范）", mdnsAnnounceSecs)
+		if d.registrar != nil {
+			log.Printf("服务发现: mDNS（外部 registrar=%T，type=%s）", d.registrar, mdnsServiceType)
+			log.Printf("  实例: %s，HTTP 端口: %d", d.instanceName, d.httpPort)
+			log.Println("  Android 端用 NsdManager 发现: _stock-server._tcp")
+		} else {
+			log.Printf("服务发现: mDNS (%s)", d.fqdn)
+			log.Println("  Android NSD / iOS Bonjour 搜索: _stock-server._tcp")
+			log.Printf("  主动宣告: 每 %d 秒发送一次（mDNS 规范）", mdnsAnnounceSecs)
+		}
 	} else {
 		log.Printf("服务发现: UDP 广播 %d", discoveryPort)
 	}

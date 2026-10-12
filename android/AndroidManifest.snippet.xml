@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  go-stock-server/android/AndroidManifest.snippet.xml
+  方案 A：Android 端 NsdManager 注册 mDNS 所需权限与组件声明片段。
+  把 <uses-permission> 复制到主项目 AndroidManifest.xml 的 <manifest> 根标签下；
+  <service> 复制到 <application> 内部（如果用前台 Service 跑 Go HTTP server）。
+
+  说明：
+    - INTERNET / ACCESS_NETWORK_STATE：HTTP server 监听 + NsdManager 必备
+    - ACCESS_WIFI_STATE / CHANGE_WIFI_MULTICAST_STATE：MulticastLock 必备（接收组播包）
+    - FOREGROUND_SERVICE / FOREGROUND_SERVICE_DATA_SYNC：Android 14+ 用前台 Service 跑长连接
+      HTTP server 必须声明（否则后台被杀，NsdManager 注册随之失效）
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- ===== 复制以下权限到主项目 AndroidManifest.xml 的根 <manifest> 标签下 ===== -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- MulticastLock（接收 mDNS 组播查询）必需 -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <!-- Android 14+ 跑长连接 HTTP server 用前台 Service 必需 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <application>
+
+        <!-- ===== 复制以下 Service 声明到主项目 <application> 内部 ===== -->
+        <!-- 前台 Service：承载 Go HTTP server + NsdManager 注册的生命周期。
+             android:foregroundServiceType="dataSync" 是 Android 14+ 跑网络服务必备。
+             exported=false：仅本应用内部启动。 -->
+        <service
+            android:name=".StockServerService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync">
+            <!-- 如果通过 START_STICKY 启动，可加 intent-filter 让系统知道 -->
+        </service>
+
+    </application>
+</manifest>

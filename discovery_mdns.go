@@ -1,8 +1,12 @@
-//go:build !windows
-// +build !windows
+//go:build !windows && !android
+// +build !windows,!android
 
-// go-stock-server/discovery_mdns.go - 非 Windows 平台的 mDNS 实现
-// 直接绑定 5353 组播端口，自行处理 mDNS 查询/宣告
+// go-stock-server/discovery_mdns.go - 非 Windows/Android 平台的 mDNS 实现
+// 直接绑定 5353 组播端口，自行处理 mDNS 查询/宣告。
+//
+// 不在 Android 上编译：Android 上 5353 端口被系统 NsdService/mdnsd 占用，
+// 且 WiFi 驱动默认过滤组播包（需 MulticastLock，纯 Go 拿不到），改为
+// 通过 SetMDNSRegistrar 注入 Kotlin NsdManager 实现（见 mdns_registrar.go）。
 package main
 
 import (
