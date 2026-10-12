@@ -1,0 +1,82 @@
+# go-stock-server/.github/workflows/verify-mdns-android.yml
+# 临时验证 workflow：仅用于验证 mDNS 方案 A 在 Android 上能编译通过。
+#
+# 背景：master 是扁平 package main 结构，android-port-v2 上的正式 build.yml
+# 依赖 cmd/server + android-app 目录，master 上没有这些目录，直接复用会失败。
+# 此 workflow 只做方案 A 必须验证的最小集合：
+#   · linux/amd64、windows/amd64、android/arm64 三平台编译通过
+#   · android/arm64 go vet 通过（验证 discovery_android.go 的占位实现签名正确）
+#   · 不跑 Gradle APK / Fyne GUI APK（依赖 android-port-v2 的目录结构）
+#
+# 后续统一化（master 重构成 cmd/server + internal/core 后）可删除此文件，
+# 改用 android-port-v2 上拉过来的正式 build.yml。
+name: Verify mDNS 方案 A
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'discovery*.go'
+      - 'mdns_registrar.go'
+      - 'main.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/verify-mdns-android.yml'
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+concurrency:
+  group: verify-mdns-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.25'
+  GOPROXY: https://proxy.golang.org,direct
+  # 与 android-port-v2 build.yml 保持一致的 go-tdx commit
+  GO_TDX_COMMIT: a9f773c55cf7279d047d8d1ad35b83d2970869ec
+
+jobs:
+  verify:
+    name: 三平台编译 + Android vet
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout go-tdx dependency（replace => ../go-tdx）
+        run: |
+          set -e
+          cd ..
+          git clone --depth 50 https://github.com/weijia/go-tdx.git go-tdx
+          cd go-tdx
+          git checkout --quiet "$GO_TDX_COMMIT"
+          ls go.mod
+
+      - name: Setup Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Go mod download
+        run: go mod download
+
+      - name: Build linux/amd64
+        run: CGO_ENABLED=0 go build ./...
+
+      - name: Build windows/amd64
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...
+
+      - name: Build android/arm64（方案A 关键验证）
+        run: GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build ./...
+
+      - name: Vet android/arm64（验证 discovery_android.go 占位实现签名正确）
+        run: GOOS=android GOARCH=arm64 CGO_ENABLED=0 go vet ./...
+
+      - name: 编译产物列表
+        run: |
+          echo "=== 验证通过：方案 A 三平台编译 + Android vet 全绿 ==="
+          echo "· linux/amd64   ✅"
+          echo "· windows/amd64 ✅"
+          echo "· android/arm64 ✅（方案A：Android 走 NsdManager 注入，不绑 5353 socket）"
