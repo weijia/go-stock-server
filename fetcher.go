@@ -436,6 +436,205 @@ func (f *StockFetcher) FetchIntraday(code string, date string) (*IntradayRespons
 	return f.parseIntraday(body, code, date)
 }
 
+// ── 分钟 K 线（HTTP 兜底源，供 HandleMinute 在 TDX 不可用时回退）───────────────
+
+// minuteKlt 将 mootdx 周期码映射为东方财富 klt（分钟周期）。
+func minuteKlt(period int) int {
+	switch period {
+	case 0:
+		return 5 // 5 分钟
+	case 1:
+		return 15
+	case 2:
+		return 30
+	case 3:
+		return 60
+	case 7:
+		return 1 // 1 分钟
+	default:
+		return 5
+	}
+}
+
+// minuteTdxKey 将 mootdx 周期码映射为腾讯 kline 周期 key（m1/m5/m15/m30/m60）。
+func minuteTdxKey(period int) string {
+	switch period {
+	case 0:
+		return "m5"
+	case 1:
+		return "m15"
+	case 2:
+		return "m30"
+	case 3:
+		return "m60"
+	case 7:
+		return "m1"
+	default:
+		return "m5"
+	}
+}
+
+// normalizeMinuteDate 将腾讯/东财分钟时间戳（"2026-09-25 14:55"）统一为
+// ISO8601（"2026-09-25T14:55:00"），便于前端/客户端稳健解析。
+func normalizeMinuteDate(s string) string {
+	s = strings.TrimSpace(s)
+	if t, err := time.Parse("2006-01-02 15:04", s); err == nil {
+		return t.Format("2006-01-02T15:04:05")
+	}
+	return s
+}
+
+// FetchMinute 通过 HTTP 行情源获取分钟 K 线（TDX 不可用时的兜底）。
+// period 沿用 mootdx 周期码：0=5分,1=15分,2=30分,3=60分,7=1分。
+// 优先腾讯(ifzq.gtimg.cn，与分时同域、本机已验证可达)，回退东财(klt 多周期)。
+// 返回的 Date 统一为 ISO8601，避免消费端解析不一致。
+func (f *StockFetcher) FetchMinute(code string, period int, minutes int) (*MinuteResponse, error) {
+	if minutes <= 0 {
+		minutes = 300
+	}
+	var tErr, eErr error
+	if data, err := f.fetchMinuteTencent(code, period, minutes); err == nil && data != nil && data.Count > 0 {
+		return data, nil
+	} else if err != nil {
+		tErr = err
+		if f.debug {
+			log.Printf("[MINUTE] 腾讯分钟K线失败 [%s]: %v", code, err)
+		}
+	}
+	if data, err := f.fetchMinuteEastMoney(code, period, minutes); err == nil && data != nil && data.Count > 0 {
+		return data, nil
+	} else if err != nil {
+		eErr = err
+		if f.debug {
+			log.Printf("[MINUTE] 东财分钟K线失败 [%s]: %v", code, err)
+		}
+	}
+	return nil, fmt.Errorf("腾讯(%v) 东财(%v) 分钟K线均不可用 [%s]", tErr, eErr, code)
+}
+
+// fetchMinuteTencent 腾讯多周期分钟 K 线（与分时同域 ifzq.gtimg.cn）。
+func (f *StockFetcher) fetchMinuteTencent(code string, period int, minutes int) (*MinuteResponse, error) {
+	prefix := marketPrefix(code)
+	sym := apiCode(code)
+	key := minuteTdxKey(period)
+	// 不带 qfq：取原始 OHLC 棒，与 TDX 原生口径一致。
+	url := fmt.Sprintf("https://ifzq.gtimg.cn/appstock/app/kline/kline?param=%s%s,%s,,%d", prefix, sym, key, minutes)
+	body, err := f.httpGet(url)
+	if err != nil {
+		return nil, fmt.Errorf("腾讯分钟K线请求失败: %w", err)
+	}
+	return f.parseMinuteTencent(body, code, key)
+}
+
+// parseMinuteTencent 解析腾讯 kline：data[code].{m5|qfqm5} = [[date,open,close,high,low,volume,...], ...]
+func (f *StockFetcher) parseMinuteTencent(content, code, key string) (*MinuteResponse, error) {
+	var root struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(content), &root); err != nil {
+		return nil, fmt.Errorf("腾讯分钟K线解析失败: %w", err)
+	}
+	raw := bytes.TrimSpace(root.Data)
+	if len(raw) == 0 || string(raw) == "null" || raw[0] == '[' {
+		return nil, fmt.Errorf("腾讯分钟K线数据未找到 %s", code)
+	}
+	var dataMap map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &dataMap); err != nil {
+		return nil, fmt.Errorf("腾讯分钟K线数据解析失败: %w", err)
+	}
+	codeKey := fmt.Sprintf("%s%s", marketPrefix(code), apiCode(code))
+	rawNode, ok := dataMap[codeKey]
+	if !ok {
+		rawNode, ok = dataMap[code]
+	}
+	if !ok {
+		return nil, fmt.Errorf("腾讯分钟K线数据未找到 %s", code)
+	}
+	var node map[string]json.RawMessage
+	if err := json.Unmarshal(rawNode, &node); err != nil {
+		return nil, fmt.Errorf("腾讯分钟K线节点解析失败: %w", err)
+	}
+	rawBars, ok := node["qfq"+key]
+	if !ok {
+		rawBars, ok = node[key]
+	}
+	if !ok {
+		return nil, fmt.Errorf("腾讯分钟K线(%s) 数据未找到 %s", key, code)
+	}
+	var bars [][]interface{}
+	if err := json.Unmarshal(rawBars, &bars); err != nil {
+		return nil, fmt.Errorf("腾讯分钟K线数组解析失败: %w", err)
+	}
+	records := make([]KlineRecord, 0, len(bars))
+	for _, item := range bars {
+		if len(item) < 6 {
+			continue
+		}
+		date, _ := item[0].(string)
+		records = append(records, KlineRecord{
+			Date:   normalizeMinuteDate(date),
+			Open:   toFloat(item[1]),
+			Close:  toFloat(item[2]),
+			High:   toFloat(item[3]),
+			Low:    toFloat(item[4]),
+			Volume: toFloat(item[5]),
+		})
+	}
+	if len(records) == 0 {
+		return nil, fmt.Errorf("腾讯分钟K线解析为空 %s", code)
+	}
+	return &MinuteResponse{Code: code, Count: len(records), Data: records}, nil
+}
+
+// fetchMinuteEastMoney 东方财富多周期分钟 K 线（klt 支持 1/5/15/30/60 分钟）。
+func (f *StockFetcher) fetchMinuteEastMoney(code string, period int, minutes int) (*MinuteResponse, error) {
+	secid := emSecid(code)
+	klt := minuteKlt(period)
+	// fqt=0 原始（与 TDX 原生口径一致）；klt=分钟周期。
+	url := fmt.Sprintf("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&klt=%d&fqt=0&forcect=1&beg=0&end=20500101", secid, klt)
+	body, err := f.httpGetWithHeaders(url, map[string]string{
+		"Referer": "https://fund.eastmoney.com/",
+	}, 8*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("东财分钟K线请求失败: %w", err)
+	}
+	return f.parseMinuteEastMoney(body, code)
+}
+
+// parseMinuteEastMoney 解析东财 kline：data.klines = ["2026-09-25 14:55,open,close,high,low,volume", ...]
+func (f *StockFetcher) parseMinuteEastMoney(content, code string) (*MinuteResponse, error) {
+	var root struct {
+		Data *struct {
+			Klines []string `json:"klines"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(content), &root); err != nil {
+		return nil, fmt.Errorf("东财分钟K线解析失败: %w", err)
+	}
+	if root.Data == nil || len(root.Data.Klines) == 0 {
+		return nil, fmt.Errorf("东财分钟K线数据未找到 %s", code)
+	}
+	records := make([]KlineRecord, 0, len(root.Data.Klines))
+	for _, kl := range root.Data.Klines {
+		parts := strings.Split(kl, ",")
+		if len(parts) < 6 {
+			continue
+		}
+		records = append(records, KlineRecord{
+			Date:   normalizeMinuteDate(parts[0]),
+			Open:   parseFloatSafe(parts[1]),
+			Close:  parseFloatSafe(parts[2]),
+			High:   parseFloatSafe(parts[3]),
+			Low:    parseFloatSafe(parts[4]),
+			Volume: parseFloatSafe(parts[5]),
+		})
+	}
+	if len(records) == 0 {
+		return nil, fmt.Errorf("东财分钟K线解析为空 %s", code)
+	}
+	return &MinuteResponse{Code: code, Count: len(records), Data: records}, nil
+}
+
 // httpGet HTTP GET 请求
 func (f *StockFetcher) httpGet(url string) (string, error) {
 	req, err := http.NewRequest("GET", url, nil)

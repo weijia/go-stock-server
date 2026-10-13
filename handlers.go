@@ -763,14 +763,46 @@ func (h *StockHandler) HandleMinute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var data *MinuteResponse
-	var err error
+	var tdxErr error
+	tdxTried := false
 	if h.tdx != nil && h.tdx.Enabled() {
-		data, err = h.tdx.GetMinute(code, period, minutes)
+		tdxTried = true
+		data, tdxErr = h.tdx.GetMinute(code, period, minutes)
 	}
-	if err != nil || data == nil || data.Count == 0 {
+
+	// TDX 不可用 / 失败 / 返回空 → 回退到 HTTP 行情源（腾讯→东财），与 HandleIntraday 一致。
+	var fbErr error
+	if tdxErr != nil || data == nil || data.Count == 0 {
+		if tdxTried && h.debug {
+			log.Printf("[MINUTE] TDX 分钟K线不可用 [%s]: %v，回退 HTTP 源", code, tdxErr)
+		}
+		var fbData *MinuteResponse
+		fbData, fbErr = h.fetcher.FetchMinute(code, period, minutes)
+		if fbErr == nil && fbData != nil && fbData.Count > 0 {
+			data = fbData
+		}
+	}
+
+	if data == nil || data.Count == 0 {
+		// 明确返回失败原因：区分「TDX 未启用 / TDX 失败 / HTTP 回退失败」，杜绝 <nil> 误导。
+		var reason string
+		if tdxTried {
+			if tdxErr != nil {
+				reason = fmt.Sprintf("TDX 分钟K线失败: %v", tdxErr)
+			} else {
+				reason = "TDX 返回空分钟数据"
+			}
+		} else {
+			reason = "TDX 数据源未启用"
+		}
+		if fbErr != nil {
+			reason += fmt.Sprintf("；HTTP 回退失败: %v", fbErr)
+		} else {
+			reason += "；HTTP 回退未返回数据"
+		}
 		h.sendJSON(w, 503, map[string]interface{}{
 			"code":    503,
-			"message": fmt.Sprintf("无可用分钟数据源: %v", err),
+			"message": fmt.Sprintf("无可用分钟数据源 (%s) [%s]", reason, code),
 		})
 		return
 	}

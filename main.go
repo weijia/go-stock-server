@@ -29,7 +29,7 @@ func main() {
 	flag.StringVar(&host, "host", getEnv("HOST", "0.0.0.0"), "监听地址")
 	flag.IntVar(&port, "port", getEnvInt("PORT", 8080), "监听端口")
 	flag.IntVar(&syncInterval, "sync-interval", getEnvInt("SYNC_INTERVAL", 60), "配置同步间隔（秒），0=禁用")
-	flag.BoolVar(&useTdx, "tdx", getEnvBool("TDX_ENABLED", false), "启用通达信 TCP 数据源（自动测速选最优）")
+	flag.BoolVar(&useTdx, "tdx", getEnvBool("TDX_ENABLED", true), "启用通达信 TCP 数据源（自动测速选最优，默认开启）")
 	flag.StringVar(&tdxHost, "tdx-host", getEnv("TDX_HOST", ""), "通达信服务器地址（指定后跳过自动测速）")
 	flag.IntVar(&tdxPort, "tdx-port", getEnvInt("TDX_PORT", 7709), "通达信服务器端口，默认 7709")
 	flag.StringVar(&quoteDBPath, "db", getEnv("DB_PATH", "../stock/instockdb.sqlite3"), "SQLite 数据库文件路径（默认共享 stock/instockdb.sqlite3，空=纯内存模式）")

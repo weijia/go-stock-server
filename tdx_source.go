@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	tdx "github.com/weijia/go-tdx"
@@ -284,7 +285,7 @@ func (ds *TdxDataSource) GetMinute(code string, period int, minutes int) (*Minut
 	records := make([]KlineRecord, 0, len(bars))
 	for _, b := range bars {
 		records = append(records, KlineRecord{
-			Date:   b.Date,
+			Date:   normalizeTdxDate(b.Date),
 			Open:   b.Open,
 			Close:  b.Close,
 			High:   b.High,
@@ -293,6 +294,27 @@ func (ds *TdxDataSource) GetMinute(code string, period int, minutes int) (*Minut
 		})
 	}
 	return &MinuteResponse{Code: code, Count: len(records), Data: records}, nil
+}
+
+// normalizeTdxDate 将通达信原生日期归一化为 ISO8601，便于前端/客户端稳健解析。
+// 通达信分钟棒日期可能是 12 位 YYYYMMDDHHMM、10 位 YYMMDDHHMM 或 8 位 YYYYMMDD。
+func normalizeTdxDate(s string) string {
+	s = strings.TrimSpace(s)
+	switch len(s) {
+	case 12:
+		if t, err := time.Parse("200601021504", s); err == nil {
+			return t.Format("2006-01-02T15:04:05")
+		}
+	case 10:
+		if t, err := time.Parse("0601021504", s); err == nil {
+			return t.Format("2006-01-02T15:04:05")
+		}
+	case 8:
+		if t, err := time.Parse("20060102", s); err == nil {
+			return t.Format("2006-01-02T15:04:05")
+		}
+	}
+	return s
 }
 
 // minuteCategory 将 mootdx 周期代码映射到 TDX category 常量（pytdx 与 go-tdx 对齐）。
