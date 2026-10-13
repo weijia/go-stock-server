@@ -191,11 +191,26 @@ class MainActivity : AppCompatActivity() {
         } else {
             logs.joinToString("\n")
         }
+        // 用可滚动+可选择文本的 TextView，方便长按复制日志
+        val scrollView = android.widget.ScrollView(this)
+        val textView = android.widget.TextView(this).apply {
+            setTextIsSelectable(true)
+            setPadding(48, 32, 48, 32)
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 12f)
+            setText(text)
+            typeface = android.graphics.Typeface.MONOSPACE
+        }
+        scrollView.addView(textView)
         AlertDialog.Builder(this)
             .setTitle(getString(R.string.log_title, logs.size))
-            .setMessage(text)
+            .setView(scrollView)
             .setPositiveButton("关闭", null)
             .setNeutralButton("刷新") { _, _ -> showServerLog() }
+            .setNegativeButton("复制全部") { _, _ ->
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("server-log", text))
+                Toast.makeText(this, "日志已复制到剪贴板", Toast.LENGTH_SHORT).show()
+            }
             .show()
     }
 

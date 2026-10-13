@@ -77,13 +77,15 @@ class StockForegroundService : Service() {
         val useTdx = prefs.getBoolean(StockApp.KEY_USE_TDX, false)
         val useMqtt = prefs.getBoolean(StockApp.KEY_USE_MQTT, false)
         val debug = prefs.getBoolean(StockApp.KEY_DEBUG, false)
-        val dbPath = prefs.getString(StockApp.KEY_DB_PATH, "") ?: ""
+        // SQLite 持久化路径：默认放到 filesDir 下，避免纯内存模式丢数据
+        val dbPath = prefs.getString(StockApp.KEY_DB_PATH, "")?.takeIf { it.isNotBlank() }
+            ?: File(filesDir, "go-server/quote_cache.sqlite").absolutePath
 
         val args = mutableListOf<String>().apply {
             add("--host"); add("0.0.0.0")
             add("--port"); add(port.toString())
             add("--sync-interval"); add(sync.toString())
-            add("--db");   add(dbPath)     // 空=纯内存
+            add("--db");   add(dbPath)
             if (useTdx)  add("--tdx")
             if (useMqtt) add("--mqtt")
             if (debug)   add("--debug")
