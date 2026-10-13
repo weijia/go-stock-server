@@ -19,5 +19,8 @@
     <string name="action_open_browser">🌐 在浏览器打开</string>
     <string name="action_share">分享访问 URL</string>
     <string name="action_battery">🔋 请求忽略电池优化（保活）</string>
+    <string name="action_view_log">📜 查看服务器日志</string>
+    <string name="log_empty">暂无日志（服务器可能未启动或无输出）</string>
+    <string name="log_title">服务器日志（最近 %1$d 行）</string>
     <string name="toast_no_ip">未检测到 WiFi IP，请连接 WiFi</string>
 </resources>

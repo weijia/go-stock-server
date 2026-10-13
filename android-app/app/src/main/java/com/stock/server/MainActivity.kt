@@ -32,6 +32,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnOpen: MaterialButton
     private lateinit var btnShare: MaterialButton
     private lateinit var btnBattery: MaterialButton
+    private lateinit var btnLog: MaterialButton
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -50,6 +51,7 @@ class MainActivity : AppCompatActivity() {
         btnOpen  = findViewById(R.id.btnOpen)
         btnShare = findViewById(R.id.btnShare)
         btnBattery = findViewById(R.id.btnBattery)
+        btnLog    = findViewById(R.id.btnLog)
 
         etPort.inputType = InputType.TYPE_CLASS_NUMBER
         etSync.inputType = InputType.TYPE_CLASS_NUMBER
@@ -60,6 +62,7 @@ class MainActivity : AppCompatActivity() {
         btnOpen.setOnClickListener  { openBrowser() }
         btnShare.setOnClickListener { shareUrl() }
         btnBattery.setOnClickListener { requestBatteryIgnore() }
+        btnLog.setOnClickListener { showServerLog() }
 
         // 若开机自启已经把服务拉起，状态同步
         refreshStatusUI()
@@ -170,6 +173,23 @@ class MainActivity : AppCompatActivity() {
         } else {
             Toast.makeText(this, "已在电池优化白名单中 ✅", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun showServerLog() {
+        val logs = synchronized(StockForegroundService.lastLogs) {
+            StockForegroundService.lastLogs.toList()
+        }
+        val text = if (logs.isEmpty()) {
+            getString(R.string.log_empty)
+        } else {
+            logs.joinToString("\n")
+        }
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.log_title, logs.size))
+            .setMessage(text)
+            .setPositiveButton("关闭", null)
+            .setNeutralButton("刷新") { _, _ -> showServerLog() }
+            .show()
     }
 
     private fun getWifiIp(): String {
