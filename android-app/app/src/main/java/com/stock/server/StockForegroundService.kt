@@ -31,6 +31,7 @@ class StockForegroundService : Service() {
     private var logThread: Thread? = null
     private var workingDir: File? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var nsdRegistrar: StockNsdRegistrar? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -130,6 +131,15 @@ class StockForegroundService : Service() {
         runStatus = 1
         prefs.edit().putBoolean(StockApp.KEY_BIN_RUNNING, true).apply()
 
+        // 用 Android NsdManager 注册 mDNS 服务（路径 1：Kotlin 独立注册）
+        // Go 侧 Android 下不绑 5353 socket，由 NsdManager 接管 mDNS 宣告
+        try {
+            nsdRegistrar = StockNsdRegistrar(this, port).also { it.register() }
+            Log.i("GoServer", "NsdManager mDNS 注册已提交: _stock-server._tcp port=$port")
+        } catch (e: Exception) {
+            Log.w("GoServer", "NsdManager mDNS 注册异常: ${e.message}")
+        }
+
         // 同步 tail 到 lastLogs（给 Activity 展示）
         logThread = Thread { tailLogs(logFile) }.apply { isDaemon = true; start() }
         // 监控进程退出 → 若是异常退出则重跑最多 3 次
@@ -173,6 +183,11 @@ class StockForegroundService : Service() {
     private fun stopServer() {
         runStatus = 0
         val proc = processRef.getAndSet(null) ?: return
+        // 注销 NsdManager mDNS 服务
+        try { nsdRegistrar?.unregister() } catch (e: Exception) {
+            Log.w("GoServer", "NsdManager mDNS 注销异常: ${e.message}")
+        }
+        nsdRegistrar = null
         // 释放 MulticastLock
         try { multicastLock?.let { if (it.isHeld) it.release() } } catch (e: Exception) {}
         multicastLock = null
