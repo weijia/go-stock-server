@@ -48,21 +48,21 @@ class StockForegroundService : Service() {
         return START_STICKY   // 被系统回收后自动重建保活
     }
 
-    // —— 从 raw/arm64-v8a 释放 Go 二进制到 filesDir（必须私有目录才没 noexec）
+    // —— 从 nativeLibraryDir 读取 Go 二进制
+    // Android 10+ (targetSdk >= 29) SELinux 禁止执行 filesDir 下的二进制
+    // (app_data_file 标签无 execute_no_trans 权限)。改用 jniLibs 方案：
+    // 二进制命名为 libgoss.so 打入 APK，安装时提取到 nativeLibraryDir
+    // (/data/app/<pkg>/lib/arm64/)，该目录有 app_library_file 标签，允许执行。
     private fun ensureBinary(): File {
-        val dir = File(filesDir, "bin").also { it.mkdirs() }
-        val dest = File(dir, "go_stock_server")
-        // 当 build-out 更新时，重新释放（按大小判断）
-        val expectedSize = resources.openRawResource(R.raw.go_stock_server).use { it.available() }
-        if (dest.exists() && dest.length() == expectedSize.toLong() && dest.canExecute()) {
-            return dest
+        val nativeDir = applicationInfo.nativeLibraryDir
+        val bin = File(nativeDir, "libgoss.so")
+        if (!bin.exists() || !bin.canExecute()) {
+            Log.e("GoServer", "nativeLibraryDir 二进制不存在或不可执行: ${bin.absolutePath}")
+            Log.e("GoServer", "nativeLibraryDir=$nativeDir")
+            throw IllegalStateException("Go 二进制未找到: ${bin.absolutePath}")
         }
-        resources.openRawResource(R.raw.go_stock_server).use { ins ->
-            dest.outputStream().use { outs -> ins.copyTo(outs) }
-        }
-        dest.setExecutable(true, false)
-        Log.i("GoServer", "释放 Go 二进制: ${dest.absolutePath} (${dest.length()/1024/1024}MB)")
-        return dest
+        Log.i("GoServer", "Go 二进制: ${bin.absolutePath} (${bin.length()/1024/1024}MB)")
+        return bin
     }
 
     private fun startServer() {
@@ -88,7 +88,13 @@ class StockForegroundService : Service() {
             if (debug)   add("--debug")
         }
 
-        val bin = ensureBinary()
+        val bin = try { ensureBinary() } catch (e: Exception) {
+            Log.e("GoServer", "Go 二进制准备失败: ${e.message}", e)
+            runStatus = 0
+            prefs.edit().putBoolean(StockApp.KEY_BIN_RUNNING, false).apply()
+            updateNotification("启动失败: ${e.message}", false)
+            return
+        }
         val cmd = arrayListOf(bin.absolutePath).apply { addAll(args) }
         val logFile = File(workingDir, "server-${System.currentTimeMillis()}.log")
 

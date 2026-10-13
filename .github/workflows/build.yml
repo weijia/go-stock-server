@@ -150,8 +150,16 @@ jobs:
         echo "VERSION=$VERSION" >> $GITHUB_ENV
         echo "VERSION_CODE=${GITHUB_RUN_NUMBER}" >> $GITHUB_ENV
         echo "APK_NAME=StockServerShell-v${VERSION}-build${GITHUB_RUN_NUMBER}.apk" >> $GITHUB_ENV
-    - name: Build Go arm64 binary & copy to Android raw
-      run: "set -e\nmkdir -p android-app/app/src/main/res/raw build-out\nLDFLAGS=\"-s -w -X go-stock-server/internal/core.serverVersion=$VERSION\"\nGOOS=android GOARCH=arm64 CGO_ENABLED=0 \\\n  go build -ldflags=\"$LDFLAGS\" -o build-out/go-stock-server-android-arm64 ./cmd/server\ncp build-out/go-stock-server-android-arm64 \\\n   android-app/app/src/main/res/raw/go_stock_server\nls -lh android-app/app/src/main/res/raw/go_stock_server\n"
+    - name: Build Go arm64 binary & copy to jniLibs
+      run: |
+        set -e
+        mkdir -p android-app/app/src/main/jniLibs/arm64-v8a build-out
+        LDFLAGS="-s -w -X go-stock-server/internal/core.serverVersion=$VERSION"
+        GOOS=android GOARCH=arm64 CGO_ENABLED=0 \
+          go build -ldflags="$LDFLAGS" -o build-out/go-stock-server-android-arm64 ./cmd/server
+        cp build-out/go-stock-server-android-arm64 \
+           android-app/app/src/main/jniLibs/arm64-v8a/libgoss.so
+        ls -lh android-app/app/src/main/jniLibs/arm64-v8a/libgoss.so
     - name: Apply CI gradle.properties (no proxy)
       run: cp android-app/gradle.properties.ci android-app/gradle.properties
     - name: Gradle assembleDebug

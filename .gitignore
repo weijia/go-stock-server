@@ -3,6 +3,7 @@
 /android-app/.gradle/
 /android-app/app/build/
 /android-app/app/src/main/res/raw/go_stock_server
+/android-app/app/src/main/jniLibs/
 /cmd/android-gui/dist/
 /StockServerGUI*.apk
 /android-gui
