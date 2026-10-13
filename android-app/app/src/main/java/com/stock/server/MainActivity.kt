@@ -64,6 +64,14 @@ class MainActivity : AppCompatActivity() {
         btnBattery.setOnClickListener { requestBatteryIgnore() }
         btnLog.setOnClickListener { showServerLog() }
 
+        // 检测真实运行状态：实测 HTTP 端口是否在监听
+        // 防止上次进程被杀时 KEY_BIN_RUNNING 残留为 true 误导 UI
+        val port = etPort.text.toString().toIntOrNull() ?: 8080
+        if (!isPortOpen(port)) {
+            getSharedPreferences(StockApp.PREF_NAME, Context.MODE_PRIVATE)
+                .edit().putBoolean(StockApp.KEY_BIN_RUNNING, false).apply()
+        }
+
         // 若开机自启已经把服务拉起，状态同步
         refreshStatusUI()
     }
@@ -120,11 +128,10 @@ class MainActivity : AppCompatActivity() {
     private fun port() = etPort.text.toString().toIntOrNull() ?: 8080
 
     private fun refreshStatusUI() {
-        val running = StockForegroundService.runStatus == 1 ||
-                getSharedPreferences(StockApp.PREF_NAME, Context.MODE_PRIVATE)
-                    .getBoolean(StockApp.KEY_BIN_RUNNING, false)
-        val ip = getWifiIp()
+        // 实测 HTTP 端口是否在监听，不依赖残留的 prefs/runStatus 静态变量
         val p = port()
+        val running = isPortOpen(p)
+        val ip = getWifiIp()
         tvStatus.text = if (running) {
             getString(R.string.label_run_status_running, p)
         } else {
@@ -190,6 +197,18 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton("关闭", null)
             .setNeutralButton("刷新") { _, _ -> showServerLog() }
             .show()
+    }
+
+    // 实测 HTTP 端口是否在监听（不读残留 prefs，避免状态不一致）
+    private fun isPortOpen(port: Int): Boolean {
+        return try {
+            val socket = java.net.Socket()
+            socket.connect(java.net.InetSocketAddress("127.0.0.1", port), 300)
+            socket.close()
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun getWifiIp(): String {
