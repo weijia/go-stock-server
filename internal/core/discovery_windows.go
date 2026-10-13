@@ -6,7 +6,7 @@
 // 注意：Windows 上 SO_REUSEADDR 必须在 bind 之前设置，因此用 net.ListenConfig
 // 的 Control 回调在创建 socket 时设置，再手动加入组播组（对齐 Python zeroconf
 // 库的做法：SO_REUSEADDR + bind 0.0.0.0:5353 + IP_ADD_MEMBERSHIP）。
-package main
+package core
 
 import (
 	"context"
@@ -42,6 +42,12 @@ func (d *ServiceDiscovery) stopMDNS() {
 		d.mdnsConn.Close()
 		log.Println("[服务发现-mDNS] mDNS 响应器已停止")
 	}
+}
+
+// startMDNSAnnounceOnly Windows 上的仅宣告模式（直接走完整 startMDNS）
+// Windows 通常有多播权限，不会走到这里；仅为满足 discovery.go 的跨平台调用
+func (d *ServiceDiscovery) startMDNSAnnounceOnly() {
+	d.startMDNS()
 }
 
 // startMDNS 启动 mDNS 宣告与查询响应（共享端口 5353）
@@ -232,19 +238,29 @@ func (d *ServiceDiscovery) sendMDNSAnnouncement() {
 		},
 	})
 
-	msg.Extra = append(msg.Extra, &dns.A{
-		Hdr: dns.RR_Header{Name: d.instanceName + ".local.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120},
-		A:   d.localIP,
-	})
+	// A 记录 (附加) — localIP 为 nil 时跳过
+	if d.localIP != nil {
+		msg.Extra = append(msg.Extra, &dns.A{
+			Hdr: dns.RR_Header{Name: d.instanceName + ".local.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120},
+			A:   d.localIP,
+		})
+	}
 
 	data, err := msg.Pack()
 	if err != nil {
+		log.Printf("[服务发现-mDNS] 宣告 Pack 失败: %v", err)
 		return
 	}
 
 	dst := &net.UDPAddr{IP: net.ParseIP(mdnsMulticastIPv4), Port: mdnsPort}
-	if _, err := d.mdnsConn.WriteToUDP(data, dst); err != nil {
+	sent, err := d.mdnsConn.WriteToUDP(data, dst)
+	if err != nil {
 		log.Printf("[服务发现-mDNS] 宣告发送失败: %v", err)
+	} else {
+		d.announceCnt++
+		if d.announceCnt <= 3 || d.announceCnt%10 == 0 {
+			log.Printf("[服务发现-mDNS] 宣告 #%d 已发送 (%d bytes)", d.announceCnt, sent)
+		}
 	}
 }
 

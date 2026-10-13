@@ -1,5 +1,5 @@
 // go-stock-server/node_config.go - 节点配置存储
-package main
+package core
 
 import (
 	"encoding/json"

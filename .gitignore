@@ -1,23 +1,26 @@
-# Binaries
+# Build outputs
+/build-out/
+/android-app/.gradle/
+/android-app/app/build/
+/android-app/app/src/main/res/raw/go_stock_server
+/android-app/app/src/main/jniLibs/
+/cmd/android-gui/dist/
+/StockServerGUI*.apk
+/android-gui
+/server
+
+# Local gradle override
+/android-app/gradle.properties.local
+/local.properties
+# NOTE: debug.keystore is intentionally committed for reproducible APK signing
+# (CI runners are ephemeral; without a fixed key, each build produces a
+# differently-signed APK → "package conflicts with existing package" on update)
+
+# Go / IDE
 *.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-
-# Test binary
 *.test
-
-# Output of go coverage
-*.out
-
-# Logs
-*.log
-
-# IDE
+*.pprof
+/dist/
 .idea/
 .vscode/
-*.swp
-*.swo
-_*
-go-stock-server
+.DS_Store

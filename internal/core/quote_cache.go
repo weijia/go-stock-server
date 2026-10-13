@@ -5,7 +5,7 @@
 //   - 每次批量写入同步 upsert 到 SQLite 表 cn_quote_cache（表结构与 Python 版完全一致），
 //     实现多进程共享 + 重启后从 DB 预热内存缓存；
 //   - 数据库打开/建表/写库失败时自动降级为纯内存模式，不影响服务可用性。
-package main
+package core
 
 import (
 	"database/sql"

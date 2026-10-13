@@ -1,6 +1,7 @@
-//go:build linux
+//go:build linux && !android
+// +build linux,!android
 
-package main
+package core
 
 import (
 	"time"

@@ -1,0 +1,90 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace = 'com.stock.server.shell'
+    compileSdk = 34
+    defaultConfig {
+        applicationId = "com.stock.server.shell"
+        minSdk = 23
+        targetSdk = 34
+        // 从环境变量读取版本号（CI 用 git tag 注入）；本地默认值
+        def vCode = (System.env.VERSION_CODE ?: "1").toInteger()
+        def vName = System.env.VERSION_NAME ?: "2.0.6-dev"
+        versionCode = vCode
+        versionName = vName
+        ndk { abiFilters("arm64-v8a") }
+    }
+    // 固定签名配置：使用仓库内 debug.keystore，确保 CI 每次构建签名一致。
+    // 否则 ephemeral runner 每次生成不同 debug key → "软件包与现有软件包冲突"。
+    signingConfigs {
+        debug {
+            storeFile file("${rootProject.projectDir}/../debug.keystore")
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
+        }
+    }
+    buildTypes {
+        debug {
+            minifyEnabled = false
+            debuggable = true
+            signingConfig signingConfigs.debug
+        }
+        release {
+            minifyEnabled = false
+            signingConfig signingConfigs.debug
+        }
+    }
+    // Go 二进制作为 libgoss.so 打入 jniLibs，必须不解压压缩
+    // (AGP 8 默认 useLegacyPackaging=false 会压缩 .so，导致运行时找不到二进制)
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+
+    // preBuild：自动拷贝预编译 Go arm64 二进制到 jniLibs（nativeLibraryDir）
+    // Android 10+ (targetSdk >= 29) SELinux 禁止执行 filesDir 下的二进制，
+    // 但允许执行 nativeLibraryDir (/data/app/<pkg>/lib/arm64/) 下的文件。
+    // 通过把二进制命名为 lib*.so 放入 jniLibs，Android 安装时自动提取到
+    // nativeLibraryDir，该目录有 app_library_file SELinux 标签，允许执行。
+    tasks.preBuild {
+        doFirst {
+            def jniDir = file("src/main/jniLibs/arm64-v8a")
+            jniDir.mkdirs()
+            def bin = new File(jniDir, "libgoss.so")
+            if (!bin.exists() || bin.length() < 10_000_000) {
+                def prebuilt = new File("/workspace/build-out/go-stock-server-android-arm64")
+                if (prebuilt.exists() && prebuilt.length() > 10_000_000) {
+                    println "[方案B-preBuild] 从 ${prebuilt.absolutePath} 拷贝 Go arm64 二进制 -> ${bin.absolutePath}"
+                    bin.bytes = prebuilt.bytes
+                    bin.setReadable(true, false)
+                } else {
+                    throw new GradleException(
+                        "缺少 Go 二进制。请先执行：\n" +
+                        "cd /workspace/go-stock-server && \\\n" +
+                        "GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build \\\n" +
+                        "  -o android-app/app/src/main/jniLibs/arm64-v8a/libgoss.so ./cmd/server")
+                }
+            } else {
+                println "[方案B-preBuild] Go arm64 二进制已就位 (${String.format("%.1f", bin.length()/1024.0/1024.0)}MB)"
+            }
+        }
+    }
+}
+dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.12.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'androidx.preference:preference-ktx:1.2.1'
+    implementation 'androidx.work:work-runtime-ktx:2.9.1'
+}

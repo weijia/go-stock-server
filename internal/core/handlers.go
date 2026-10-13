@@ -1,5 +1,5 @@
 // go-stock-server/handlers.go - HTTP API 处理器
-package main
+package core
 
 import (
 	"encoding/json"
@@ -12,7 +12,7 @@ import (
 )
 
 var serverStartTime = time.Now()
-var serverVersion = "2.0.0-go"
+var serverVersion = "2.0.6-dev"
 
 // StockHandler HTTP 请求处理器
 type StockHandler struct {

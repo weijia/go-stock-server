@@ -1,5 +1,5 @@
 // go-stock-server/discovery.go - 服务发现（mDNS 响应/宣告 + UDP 广播）
-package main
+package core
 
 import (
 	"encoding/json"
@@ -33,10 +33,12 @@ type ServiceDiscovery struct {
 	localIP      net.IP
 	fqdn         string
 
-	mdnsConn    *net.UDPConn
-	mdnsStop    chan struct{}
-	mdnsOK      bool
-	queryCnt    int // 收到的查询数
+	mdnsConn          *net.UDPConn
+	mdnsStop          chan struct{}
+	mdnsOK            bool
+	mdnsAnnounceOnly  bool   // 仅宣告模式（无多播接收权限时）
+	queryCnt          int    // 收到的查询数
+	announceCnt       int    // 发送的宣告数
 
 	udpConn      *net.UDPConn
 	udpStop      chan struct{}
@@ -54,7 +56,42 @@ type ServiceDiscovery struct {
 	// discoveryStop 整个发现生命周期的停止信号（watchIPChange / selfHealLoop 常驻）。
 	discoveryStop chan struct{}
 
+	// registrar 外部 mDNS 注册器（方案 A）。非 nil 时优先用外部 registrar
+	// 注册（典型场景：Android 端注入的 NsdManager 包装），跳过内置 socket 版本。
+	// PC 平台默认为 nil，自动回退到 discovery_mdns.go / discovery_windows.go 的 startMDNS。
+	registrar MDNSRegistrar
+
 	wg sync.WaitGroup
+}
+
+// DiscoveryStatus 服务发现状态（供 GUI / 外部查询）
+type DiscoveryStatus struct {
+	Running       bool   // mDNS 是否已启动
+	AnnounceOnly  bool   // 是否为仅宣告模式
+	LocalIP       string // 本机 IP
+	HTTPPort      int    // HTTP 端口
+	FQDN          string // mDNS 服务实例名
+	QueryCount    int    // 收到的查询数
+	AnnounceCount int    // 发送的宣告数
+	BroadcastCount int   // UDP 广播次数
+}
+
+// Status 返回当前服务发现状态快照
+func (d *ServiceDiscovery) Status() DiscoveryStatus {
+	ipStr := ""
+	if d.localIP != nil {
+		ipStr = d.localIP.String()
+	}
+	return DiscoveryStatus{
+		Running:        d.mdnsOK,
+		AnnounceOnly:   d.mdnsAnnounceOnly,
+		LocalIP:        ipStr,
+		HTTPPort:       d.httpPort,
+		FQDN:           d.fqdn,
+		QueryCount:     d.queryCnt,
+		AnnounceCount:  d.announceCnt,
+		BroadcastCount: d.broadcastCnt,
+	}
 }
 
 // NewServiceDiscovery 创建服务发现实例
@@ -71,15 +108,24 @@ func NewServiceDiscovery(httpPort int) *ServiceDiscovery {
 // Start 启动服务发现
 func (d *ServiceDiscovery) Start() {
 	d.localIP = d.findLocalIPv4()
+	log.Printf("[服务发现] 本机 IPv4 探测结果: %v", d.localIP)
 	if d.localIP == nil {
-		log.Println("[服务发现] 无法获取本机 IPv4，仅启动 UDP 广播")
+		log.Println("[服务发现] 无法获取本机 IPv4，mDNS 降级为仅宣告模式")
+		d.fqdn = fmt.Sprintf("%s.%s.local", d.instanceName, mdnsServiceType)
+		d.startMDNSAnnounceOnly()
 		go d.udpBroadcastLoop()
 		return
 	}
 	d.fqdn = fmt.Sprintf("%s.%s.local", d.instanceName, mdnsServiceType)
 
 	d.discoveryStop = make(chan struct{})
-	d.startMDNS()
+
+	// 优先用外部 mDNS registrar（方案 A：Android NsdManager 注入实现）；
+	// 注册失败或未注入时回退到内置 socket 实现（PC 平台）。
+	if !d.tryExternalMDNS() {
+		d.startMDNS()
+	}
+
 	go d.udpBroadcastLoop()
 	// 事件驱动监听本机 IP 变化（换网/拔插网卡后客户端仍能发现），IP 一变即重建 mDNS
 	go d.watchIPChange()
@@ -112,7 +158,17 @@ func (d *ServiceDiscovery) onIPChanged(newIP net.IP) {
 // restartMDNS 停止并重新启动 mDNS（IP 变化后调用）。注意：仅重建 mDNS socket/协程，
 // 不再重启 watchIPChange（其在本进程生命周期内常驻于 discoveryStop），避免重复注册
 // 导致 IP 监听句柄被旧协程的 defer 清掉而泄漏/失效。
+//
+// 若已注入外部 registrar（Android NsdManager），改走 Unregister + Register；
+// NsdManager 通常自身能感知 IP 变化，但显式重注册更稳妥。
 func (d *ServiceDiscovery) restartMDNS() {
+	if d.unregisterExternalMDNS() {
+		// 外部 registrar 已注销，重新注册；失败回退到内置 socket 实现
+		if !d.tryExternalMDNS() {
+			d.startMDNS()
+		}
+		return
+	}
 	d.stopMDNS()
 	d.mdnsStop = make(chan struct{})
 	d.startMDNS()
@@ -131,7 +187,13 @@ func (d *ServiceDiscovery) Stop() {
 		d.ipNotifyCancel()
 		d.ipNotifyCancel = nil
 	}
-	d.stopMDNS()
+
+	// 优先注销外部 registrar（Android NsdManager）；无外部 registrar 或注销失败时
+	// 回退到内置 socket 关闭。
+	if !d.unregisterExternalMDNS() {
+		d.stopMDNS()
+	}
+
 	if d.udpConn != nil {
 		close(d.udpStop)
 		d.udpConn.Close()
@@ -183,40 +245,22 @@ func privateScore(ip net.IP) int {
 }
 
 // findLocalIPv4 找本机主网卡 IPv4（启动与 IP 变化重选共用同一逻辑）
+// 零网络IO优先：先查网卡列表，Dial 仅作 fallback（1s 超时）
 func (d *ServiceDiscovery) findLocalIPv4() net.IP {
-	// 1) 优先用默认路由出口 IP（连 8.8.8.8 的本地地址，仅查路由表不发包）
-	if conn, err := net.Dial("udp", "8.8.8.8:80"); err == nil {
+	// 1) 先查网卡列表 — 零网络IO，不会阻塞
+	if ips := allLocalIPv4(); len(ips) > 0 {
+		sort.SliceStable(ips, func(i, j int) bool {
+			return privateScore(ips[i]) > privateScore(ips[j])
+		})
+		return ips[0]
+	}
+	// 2) fallback: Dial 8.8.8.8 查路由出口（1s 超时）
+	if conn, err := net.DialTimeout("udp", "8.8.8.8:80", 1*time.Second); err == nil {
 		ip := conn.LocalAddr().(*net.UDPAddr).IP
 		conn.Close()
 		if ip4 := ip.To4(); ip4 != nil && !ip4.IsLoopback() && !isAPIPA(ip4) {
 			return ip4
 		}
-	}
-	// 2) 兜底：收集所有非回环、非 APIPA 的 IPv4，按私有地址优先级排序取最优
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
-	var candidates []net.IP
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, _ := iface.Addrs()
-		for _, addr := range addrs {
-			if ipNet, ok := addr.(*net.IPNet); ok {
-				if ip4 := ipNet.IP.To4(); ip4 != nil && !ip4.IsLoopback() && !isAPIPA(ip4) {
-					candidates = append(candidates, ip4)
-				}
-			}
-		}
-	}
-	// 稳定排序：优先 192.168 > 10 > 172.16，其余靠后；同分保持原顺序
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return privateScore(candidates[i]) > privateScore(candidates[j])
-	})
-	if len(candidates) > 0 {
-		return candidates[0]
 	}
 	return nil
 }
@@ -267,17 +311,32 @@ func (d *ServiceDiscovery) sendUDPBroadcast() {
 // PrintInfo 打印服务发现信息
 func (d *ServiceDiscovery) PrintInfo(localIP string) {
 	if d.mdnsOK {
-		log.Printf("服务发现: mDNS (%s)", d.fqdn)
-		log.Println("  Android NSD / iOS Bonjour 搜索: _stock-server._tcp")
-		log.Printf("  主动宣告: 每 %d 秒发送一次（mDNS 规范）", mdnsAnnounceSecs)
+		if d.registrar != nil {
+			log.Printf("服务发现: mDNS（外部 registrar=%T，type=%s）", d.registrar, mdnsServiceType)
+			log.Printf("  实例: %s，HTTP 端口: %d", d.instanceName, d.httpPort)
+			log.Println("  Android 端用 NsdManager 发现: _stock-server._tcp")
+		} else {
+			log.Printf("服务发现: mDNS (%s)", d.fqdn)
+			log.Println("  Android NSD / iOS Bonjour 搜索: _stock-server._tcp")
+			log.Printf("  主动宣告: 每 %d 秒发送一次（mDNS 规范）", mdnsAnnounceSecs)
+		}
 	} else {
 		log.Printf("服务发现: UDP 广播 %d", discoveryPort)
 	}
 }
 
-// getLocalIP 获取本机 IP
+// getLocalIP 获取本机 IP（零网络IO优先，Dial 仅作 fallback）
 func getLocalIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
+	// 1) 先查网卡列表 — 零网络IO，不会阻塞
+	if ips := allLocalIPv4(); len(ips) > 0 {
+		// 按 privateScore 排序取最优
+		sort.SliceStable(ips, func(i, j int) bool {
+			return privateScore(ips[i]) > privateScore(ips[j])
+		})
+		return ips[0].String()
+	}
+	// 2) fallback: Dial 8.8.8.8 查路由出口（1s 超时）
+	conn, err := net.DialTimeout("udp", "8.8.8.8:80", 1*time.Second)
 	if err != nil {
 		return "127.0.0.1"
 	}

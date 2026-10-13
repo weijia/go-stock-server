@@ -8,7 +8,7 @@
 //   - 对最新一条附加 40 个多周期窗口极值（*_min/*_max），口径与 Python
 //     fetch_valuation_window_stats 一致（滚动窗口 min_periods=2，忽略 NULL）；
 //   - ETF/基金（1/5 开头）估值字段本身为 NULL，直接返回库数据，不回源。
-package main
+package core
 
 import (
 	"database/sql"

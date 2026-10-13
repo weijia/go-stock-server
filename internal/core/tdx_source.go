@@ -1,5 +1,5 @@
 // go-stock-server/tdx_source.go — 通达信 TCP 数据源接入
-package main
+package core
 
 import (
 	"fmt"
