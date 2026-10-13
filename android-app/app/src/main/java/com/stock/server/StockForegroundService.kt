@@ -115,7 +115,6 @@ class StockForegroundService : Service() {
             ProcessBuilder(cmd)
                 .directory(workingDir)
                 .redirectErrorStream(true)
-                .redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
                 .apply { environment()["GODEBUG"] = "netdns=go" }   // 强制纯 Go DNS 解析
                 .start()
         } catch (e: Exception) {
@@ -140,8 +139,8 @@ class StockForegroundService : Service() {
             Log.w("GoServer", "NsdManager mDNS 注册异常: ${e.message}")
         }
 
-        // 同步 tail 到 lastLogs（给 Activity 展示）
-        logThread = Thread { tailLogs(logFile) }.apply { isDaemon = true; start() }
+        // 同步 tail 到 lastLogs（给 Activity 展示）+ 写入日志文件
+        logThread = Thread { tailLogs(proc, logFile) }.apply { isDaemon = true; start() }
         // 监控进程退出 → 若是异常退出则重跑最多 3 次
         Thread({
             val exitCode = runCatching { proc.waitFor() }.getOrDefault(-1)
@@ -164,19 +163,27 @@ class StockForegroundService : Service() {
         Log.i("GoServer", "已启动: ${cmd.joinToString(" ")}")
     }
 
-    private fun tailLogs(file: File) {
-        val reader: BufferedReader?
+    // 从进程 stdout 管道实时读取（管道阻塞：有数据就读到，无数据则等待），
+    // 同时写入日志文件 + lastLogs（给 Activity 展示）。
+    // 原方案用 redirectOutput(文件)+读文件，但 readLine() 读到文件末尾就返回 null
+    // 导致 tail 退出，无法持续跟踪新输出（不是 tail -f）。
+    private fun tailLogs(proc: Process, logFile: File) {
+        val reader = BufferedReader(InputStreamReader(proc.inputStream, Charsets.UTF_8))
+        var writer: java.io.FileWriter? = null
+        try { writer = java.io.FileWriter(logFile, true) } catch (_: Exception) {}
         try {
-            reader = BufferedReader(InputStreamReader(file.inputStream()))
-        } catch (t: Throwable) { return }
-        reader.use { r ->
             while (runStatus == 1 && !Thread.interrupted()) {
-                val line = r.readLine() ?: break
+                val line = reader.readLine() ?: break   // 进程关闭管道时返回 null
                 synchronized(lastLogs) {
                     lastLogs.addLast(line)
                     while (lastLogs.size > 500) lastLogs.removeFirst()
                 }
+                try { writer?.write(line + "\n") } catch (_: Exception) {}
             }
+        } catch (_: Exception) {
+        } finally {
+            try { writer?.flush(); writer?.close() } catch (_: Exception) {}
+            try { reader.close() } catch (_: Exception) {}
         }
     }
 
