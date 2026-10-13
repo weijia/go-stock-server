@@ -5,6 +5,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
@@ -35,7 +36,7 @@ class StockForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        startForeground(StockApp.NOTIF_ID, buildNotification(getString(R.string.notify_running)))
+        startForegroundCompat(buildNotification(getString(R.string.notify_running)))
         workingDir = File(filesDir, "go-server").also { it.mkdirs() }
     }
 
@@ -103,12 +104,22 @@ class StockForegroundService : Service() {
             Log.w("GoServer", "MulticastLock 获取失败: ${e.message}（mDNS 仅宣告模式）")
         }
 
-        val proc = ProcessBuilder(cmd)
-            .directory(workingDir)
-            .redirectErrorStream(true)
-            .redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
-            .apply { environment()["GODEBUG"] = "netdns=go" }   // 强制纯 Go DNS 解析
-            .start()
+        val proc = try {
+            ProcessBuilder(cmd)
+                .directory(workingDir)
+                .redirectErrorStream(true)
+                .redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
+                .apply { environment()["GODEBUG"] = "netdns=go" }   // 强制纯 Go DNS 解析
+                .start()
+        } catch (e: Exception) {
+            Log.e("GoServer", "Go 二进制启动失败: ${e.message}", e)
+            runStatus = 0
+            prefs.edit().putBoolean(StockApp.KEY_BIN_RUNNING, false).apply()
+            try { multicastLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
+            multicastLock = null
+            updateNotification("启动失败: ${e.message}", false)
+            return
+        }
         processRef.set(proc)
         runStatus = 1
         prefs.edit().putBoolean(StockApp.KEY_BIN_RUNNING, true).apply()
@@ -173,7 +184,17 @@ class StockForegroundService : Service() {
 
     private fun updateNotification(text: String, running: Boolean) {
         val status = if (running) "运行中" else "已停止"
-        startForeground(StockApp.NOTIF_ID, buildNotification("$text · $status"))
+        startForegroundCompat(buildNotification("$text · $status"))
+    }
+
+    // Android 14 (API 34) 强制要求 startForeground 显式声明 foregroundServiceType,
+    // 否则抛 ForegroundServiceTypeNotAllowed；低版本用双参数版本即可。
+    private fun startForegroundCompat(notification: Notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(StockApp.NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(StockApp.NOTIF_ID, notification)
+        }
     }
 
     private fun buildNotification(text: String): Notification {
