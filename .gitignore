@@ -24,3 +24,6 @@
 .idea/
 .vscode/
 .DS_Store
+*.log
+_tmp*
+go-stock-server
