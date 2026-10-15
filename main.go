@@ -34,8 +34,8 @@ func main() {
 	flag.IntVar(&tdxPort, "tdx-port", getEnvInt("TDX_PORT", 7709), "通达信服务器端口，默认 7709")
 	flag.StringVar(&quoteDBPath, "db", getEnv("DB_PATH", "../stock/instockdb.sqlite3"), "SQLite 数据库文件路径（默认共享 stock/instockdb.sqlite3，空=纯内存模式）")
 
-	// ---- MQTT 接入层（默认关闭）----
-	mqttEnabled := getEnvBool("MQTT_ENABLED", false)
+	// ---- MQTT 接入层（默认开启）----
+	mqttEnabled := getEnvBool("MQTT_ENABLED", true)
 	mqttBroker := getEnv("MQTT_BROKER", "wss://broker.emqx.io:8084/mqtt")
 	mqttTopic := getEnv("MQTT_TOPIC", "secure/stock-price-mqtt")
 	mqttPassword := getEnv("MQTT_PASSWORD", "stock_price_mqtt_S3cret")
@@ -44,7 +44,7 @@ func main() {
 	mqttPushInterval := getEnvInt("MQTT_PUSH_INTERVAL", 5)
 	mqttPushOnlyTrading := getEnvBool("MQTT_PUSH_ONLY_TRADING", false)
 
-	flag.BoolVar(&mqttEnabled, "mqtt", mqttEnabled, "启用 MQTT 接入层（实时价推送 + 命令响应）")
+	flag.BoolVar(&mqttEnabled, "mqtt", mqttEnabled, "启用 MQTT 接入层（实时价推送 + 命令响应，默认开启，-mqtt=false 关闭）")
 	flag.StringVar(&mqttBroker, "mqtt-broker", mqttBroker, "MQTT broker 地址 (wss:// 或 mqtt://)")
 	flag.StringVar(&mqttTopic, "mqtt-topic", mqttTopic, "MQTT 订阅/发布 Topic")
 	flag.StringVar(&mqttPassword, "mqtt-password", mqttPassword, "MQTT 消息 AES 加密密码（须与控制端一致）")

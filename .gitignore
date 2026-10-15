@@ -27,3 +27,6 @@
 *.log
 _tmp*
 go-stock-server
+stock/instockdb.sqlite3
+stock/instockdb.sqlite3-shm
+stock/instockdb.sqlite3-wal

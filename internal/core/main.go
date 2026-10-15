@@ -41,7 +41,10 @@ func DefaultConfig() ServerConfig {
 		Host:                "0.0.0.0",
 		Port:                8080,
 		SyncInterval:        60,
+		UseTDX:              true,
+		TDXPort:             7709,
 		DBPath:              "../stock/instockdb.sqlite3",
+		EnableMQTT:          true,
 		MQTTBroker:          "wss://broker.emqx.io:8084/mqtt",
 		MQTTTopic:           "secure/stock-price-mqtt",
 		MQTTPassword:        "stock_price_mqtt_S3cret",
@@ -94,12 +97,12 @@ func RunLegacyMain(args []string, block bool) (*RunningServer, error) {
 	fs.StringVar(&host, "host", getEnv("HOST", "0.0.0.0"), "监听地址")
 	fs.IntVar(&port, "port", getEnvInt("PORT", 8080), "监听端口")
 	fs.IntVar(&syncInterval, "sync-interval", getEnvInt("SYNC_INTERVAL", 60), "配置同步间隔（秒），0=禁用")
-	fs.BoolVar(&useTdx, "tdx", getEnvBool("TDX_ENABLED", false), "启用通达信 TCP 数据源")
+	fs.BoolVar(&useTdx, "tdx", getEnvBool("TDX_ENABLED", true), "启用通达信 TCP 数据源（自动测速选最优，默认开启，-tdx=false 关闭）")
 	fs.StringVar(&tdxHost, "tdx-host", getEnv("TDX_HOST", ""), "通达信服务器地址")
 	fs.IntVar(&tdxPort, "tdx-port", getEnvInt("TDX_PORT", 7709), "通达信服务器端口")
 	fs.StringVar(&quoteDBPath, "db", getEnv("DB_PATH", "../stock/instockdb.sqlite3"), "SQLite 路径（空=纯内存）")
 
-	mqttEnabled = getEnvBool("MQTT_ENABLED", false)
+	mqttEnabled = getEnvBool("MQTT_ENABLED", true)
 	mqttBroker = getEnv("MQTT_BROKER", "wss://broker.emqx.io:8084/mqtt")
 	mqttTopic = getEnv("MQTT_TOPIC", "secure/stock-price-mqtt")
 	mqttPassword = getEnv("MQTT_PASSWORD", "stock_price_mqtt_S3cret")
@@ -108,7 +111,7 @@ func RunLegacyMain(args []string, block bool) (*RunningServer, error) {
 	mqttPushInterval = getEnvInt("MQTT_PUSH_INTERVAL", 5)
 	mqttPushOnlyTrading = getEnvBool("MQTT_PUSH_ONLY_TRADING", false)
 
-	fs.BoolVar(&mqttEnabled, "mqtt", mqttEnabled, "启用 MQTT 接入层")
+	fs.BoolVar(&mqttEnabled, "mqtt", mqttEnabled, "启用 MQTT 接入层（默认开启，-mqtt=false 关闭）")
 	fs.StringVar(&mqttBroker, "mqtt-broker", mqttBroker, "MQTT broker 地址")
 	fs.StringVar(&mqttTopic, "mqtt-topic", mqttTopic, "MQTT 订阅/发布 Topic")
 	fs.StringVar(&mqttPassword, "mqtt-password", mqttPassword, "MQTT AES 密码")
@@ -160,6 +163,9 @@ func startFromConfig(cfg ServerConfig, block bool) (*RunningServer, error) {
 
 	var tdxDS *TdxDataSource
 	if cfg.UseTDX {
+		if cfg.TDXPort == 0 {
+			cfg.TDXPort = 7709
+		}
 		log.Println("[启动 step 2/8] 初始化 TDX 数据源...")
 		if cfg.TDXHost != "" {
 			tdxDS = NewTdxDataSource(false, cfg.Debug)
@@ -218,7 +224,21 @@ func startFromConfig(cfg ServerConfig, block bool) (*RunningServer, error) {
 
 	var mqttClient *MQTTPriceClient
 	if cfg.EnableMQTT {
-		log.Println("[启动 step 7/8] 初始化 MQTT...")
+		// 调用方（GUI / 方案 B、C）可能只设了 EnableMQTT 而漏传连接参数，
+		// 这里统一补齐默认值，避免连空 broker。
+		if cfg.MQTTBroker == "" {
+			cfg.MQTTBroker = "wss://broker.emqx.io:8084/mqtt"
+		}
+		if cfg.MQTTTopic == "" {
+			cfg.MQTTTopic = "secure/stock-price-mqtt"
+		}
+		if cfg.MQTTPassword == "" {
+			cfg.MQTTPassword = "stock_price_mqtt_S3cret"
+		}
+		if cfg.MQTTPushInterval < 1 {
+			cfg.MQTTPushInterval = 5
+		}
+		log.Printf("[启动 step 7/8] 初始化 MQTT... (broker=%s topic=%s)", cfg.MQTTBroker, cfg.MQTTTopic)
 		mqttClient = NewMQTTClient(handler, cfg.MQTTBroker, cfg.MQTTTopic, cfg.MQTTPassword,
 			cfg.MQTTClientID, cfg.MQTTUserSuffix, cfg.MQTTPushInterval, cfg.MQTTPushOnlyTrading)
 		mqttClient.Start()

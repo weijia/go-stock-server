@@ -630,8 +630,25 @@ func (c *MQTTPriceClient) onMessage(client mqtt.Client, msg mqtt.Message) {
 		reqMsgID = im
 	}
 
+	// 命令负载：约定放在内层 data（与 Python mqtt_protocol 及 my-quant 一致）；
+	// 兼容早期扁平写法（codes / interval 与 action 同级）。
+	data := map[string]interface{}{}
+	if d, ok := inner["data"].(map[string]interface{}); ok {
+		data = d
+	}
+	if _, ok := data["codes"]; !ok {
+		if raw, ok := inner["codes"]; ok {
+			data["codes"] = raw
+		}
+	}
+	if _, ok := data["interval"]; !ok {
+		if raw, ok := inner["interval"]; ok {
+			data["interval"] = raw
+		}
+	}
+
 	if action == "subscribe" || action == "unsubscribe" || action == "list_subs" {
-		c.handleSubscription(action, inner, reqMsgID)
+		c.handleSubscription(action, data, reqMsgID)
 		return
 	}
 
@@ -645,21 +662,20 @@ func (c *MQTTPriceClient) onMessage(client mqtt.Client, msg mqtt.Message) {
 		return
 	}
 
-	data := map[string]interface{}{}
-	if d, ok := inner["data"].(map[string]interface{}); ok {
-		data = d
-	}
 	resp := c.cmd.execute(action, data)
 	c.sendResponse(resp, reqMsgID)
 }
 
 func (c *MQTTPriceClient) handleSubscription(action string, data map[string]interface{}, reqMsgID string) {
+	codes := parseCodes(data["codes"])
+	log.Printf("[MQTT] 订阅命令 action=%s codes=%v interval=%v msgId=%s",
+		action, codes, data["interval"], reqMsgID)
 	c.subsLock.Lock()
 	switch action {
 	case "subscribe":
-		codes := parseCodes(data["codes"])
 		if len(codes) == 0 {
 			c.subsLock.Unlock()
+			log.Printf("[MQTT] subscribe 被拒绝：codes 为空（请求 data=%v）", data)
 			c.sendResponse(errResp("subscribe", "缺少 codes"), reqMsgID)
 			return
 		}
@@ -784,12 +800,15 @@ func (c *MQTTPriceClient) pushLoop() {
 		if c.pushOnlyTrading && !marketOpen() {
 			continue
 		}
-		if c.handler.tdx == nil || !c.handler.tdx.Enabled() {
-			continue
-		}
+		// TDX 不可用时不再跳过：fetchBatchQuotes 内部腾讯 HTTP 即为兜底数据源，
+		// 且明确把 PriceSource 置空（视为实时价），与「腾讯兜底」的设计一致。
 		quotes := c.handler.fetchBatchQuotes(codes)
 		if len(quotes) == 0 {
+			log.Printf("[MQTT] 本轮无行情可推送（订阅 %d 只，数据源均失败）", len(codes))
 			continue
+		}
+		if c.handler.debug {
+			log.Printf("[MQTT] 推送 quote_push %d/%d 只", len(quotes), len(codes))
 		}
 		c.handler.quoteCache.UpsertMany(quotes)
 		for _, code := range codes {
