@@ -140,9 +140,11 @@ func (f *StockFetcher) FetchKline(code string, days int) (*KlineResponse, string
 		name  string
 		fetch func() (*KlineResponse, error)
 	}{
-		{"腾讯A股", func() (*KlineResponse, error) { return f.fetchKlineTencent(prefix, sym, days) }},
+		// 腾讯 fqkline 接口近期被 WAF 持久拦截（HTTP 501 + HTML 拦截页），
+		// 故将其排到最后作为兜底；优先尝试独立域名的新浪/东财，减少噪声与无效重试。
 		{"新浪A股", func() (*KlineResponse, error) { return f.fetchKlineSina(code, days) }},
 		{"东财A股", func() (*KlineResponse, error) { return f.fetchKlineEastMoney(code, days) }},
+		{"腾讯A股", func() (*KlineResponse, error) { return f.fetchKlineTencent(prefix, sym, days) }},
 	}
 
 	var lastErr error
@@ -337,6 +339,13 @@ func (f *StockFetcher) httpGetWithHeaders(rawURL string, headers map[string]stri
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		snippet := strings.TrimSpace(string(body))
+		if len(snippet) > 200 {
+			snippet = snippet[:200]
+		}
+		return "", fmt.Errorf("HTTP %d: 接口无响应或被拦截(%s)", resp.StatusCode, snippet)
 	}
 	return string(body), nil
 }
@@ -667,6 +676,18 @@ func (f *StockFetcher) httpGet(url string) (string, error) {
 		return "", err
 	}
 
+	// 关键修复：校验 HTTP 状态码。腾讯 fqkline 被 WAF 拦截时返回 HTTP 501 +
+	// HTML 拦截页（以 '<' 开头），若不拦截会被当成 JSON 喂给解析器，
+	// 报出 "invalid character '<'" 这类误导性错误。非 2xx 直接报错，
+	// 让上层多源兜底/重试生效，并暴露真实原因。
+	if resp.StatusCode != http.StatusOK {
+		snippet := strings.TrimSpace(string(body))
+		if len(snippet) > 200 {
+			snippet = snippet[:200]
+		}
+		return "", fmt.Errorf("HTTP %d: 接口无响应或被拦截(%s)", resp.StatusCode, snippet)
+	}
+
 	// 腾讯实时行情接口 qt.gtimg.cn 返回 GBK 编码，需转 UTF-8；K线接口为 UTF-8 JSON。
 	if strings.Contains(url, "qt.gtimg.cn") {
 		return gbkToUtf8(body), nil
@@ -735,6 +756,13 @@ func (f *StockFetcher) parseRealtime(content, code string) (*RealtimeData, error
 // parseKline 解析 K 线数据（标准 JSON 解码，覆盖 qfqday / day 两种字段）
 func (f *StockFetcher) parseKline(content, code string, days int) (*KlineResponse, error) {
 	key := fmt.Sprintf("%s%s", marketPrefix(code), apiCode(code))
+
+	// 防御：若响应体以 '<' 开头，说明拿到的是 HTML（WAF 拦截页/代理错误页），
+	// 并非 JSON。直接给出明确错误，避免误导性 "invalid character '<'"。
+	// （httpGet 已对 HTTP 非 2xx 做拦截，这里兜底 200 但内容为 HTML 的异常。）
+	if strings.HasPrefix(strings.TrimSpace(content), "<") {
+		return nil, fmt.Errorf("接口返回HTML(疑似WAF/代理拦截) %s", code)
+	}
 
 	var root struct {
 		Code int             `json:"code"`
