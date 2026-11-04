@@ -7,7 +7,6 @@ package core
 
 import (
 	"crypto/rand"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -18,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	mqtt "github.com/eclipse/paho.mqtt.golang"
+	msgfailover "github.com/stock-server/msg-failover-go"
 )
 
 // ── 命令执行器 ──────────────────────────────────────────────────────────────
@@ -437,10 +436,12 @@ type MQTTPriceClient struct {
 	clientID string
 	userSuffix string
 	pushInterval int
-	pushOnlyTrading bool
-	wsPath string
+	pushOnlyTrading  bool
+	jetStreamURL     string
+	jetStreamEnabled bool
+	wsPath           string
 
-	client    mqtt.Client
+	fc        *msgfailover.Client
 	connected bool
 	running   bool
 	lastPong  int64
@@ -457,7 +458,7 @@ type MQTTPriceClient struct {
 }
 
 // NewMQTTClient 创建 MQTT 客户端
-func NewMQTTClient(h *StockHandler, broker, topic, password, clientID, userSuffix string, pushInterval int, pushOnlyTrading bool) *MQTTPriceClient {
+func NewMQTTClient(h *StockHandler, broker, topic, password, clientID, userSuffix string, pushInterval int, pushOnlyTrading bool, jetStreamURL string, jetStreamEnabled bool) *MQTTPriceClient {
 	if clientID == "" {
 		clientID = "ps_" + randHex(6)
 	}
@@ -466,98 +467,89 @@ func NewMQTTClient(h *StockHandler, broker, topic, password, clientID, userSuffi
 	}
 	_, _, _, wsPath := parseBrokerURL(broker)
 	return &MQTTPriceClient{
-		handler:         h,
-		broker:          broker,
-		topic:           topic,
-		password:        password,
-		clientID:        clientID,
-		userSuffix:      userSuffix,
-		pushInterval:    pushInterval,
-		pushOnlyTrading: pushOnlyTrading,
-		wsPath:          wsPath,
-		subs:            map[string]bool{},
-		seen:            map[string]int64{},
-		cmd:             &mqttCommandHandler{h: h},
+		handler:          h,
+		broker:           broker,
+		topic:            topic,
+		password:         password,
+		clientID:         clientID,
+		userSuffix:       userSuffix,
+		pushInterval:     pushInterval,
+		pushOnlyTrading:  pushOnlyTrading,
+		jetStreamURL:     jetStreamURL,
+		jetStreamEnabled: jetStreamEnabled,
+		wsPath:           wsPath,
+		subs:             map[string]bool{},
+		seen:             map[string]int64{},
+		cmd:              &mqttCommandHandler{h: h},
 	}
 }
 
-func (c *MQTTPriceClient) buildOptions() *mqtt.ClientOptions {
-	opts := mqtt.NewClientOptions()
-	opts.SetClientID(c.clientID)
-	opts.SetAutoReconnect(true)
-	opts.SetConnectRetry(true)
-	opts.SetConnectRetryInterval(2 * time.Second)
-	opts.SetMaxReconnectInterval(30 * time.Second)
-	opts.SetConnectTimeout(30 * time.Second)
-	opts.SetKeepAlive(60 * time.Second)
-	opts.SetCleanSession(true)
-	opts.SetOnConnectHandler(c.onConnect)
-	opts.SetConnectionLostHandler(c.onDisconnect)
-	opts.SetDefaultPublishHandler(c.onMessage)
-	opts.AddBroker(c.broker)
-
-	scheme, _, _, _ := parseBrokerURL(c.broker)
-	if scheme == "wss" || scheme == "ws" {
-		opts.SetWebsocketOptions(&mqtt.WebsocketOptions{})
-	}
-	if scheme == "wss" || scheme == "mqtts" || scheme == "ssl" || scheme == "tls" {
-		opts.SetTLSConfig(&tls.Config{MinVersion: tls.VersionTLS12})
-	}
-	return opts
-}
-
-// Start 启动 MQTT 客户端（后台连接 + 推送/心跳/状态线程）
+// Start 启动 MQTT 客户端（经 msg-failover 库：缺省主用 MQTT，备为 JetStream，支持故障转移）
 func (c *MQTTPriceClient) Start() bool {
 	c.running = true
+	// 仅当显式启用 JetStream 故障转移时才把备 URL 传给库；否则 Backup.URL 为空，
+	// 库的 noBackup 守卫生效，退化为纯 MQTT（--jetstream / --jetstream-discover 才开启）。
+	backupURL := ""
+	if c.jetStreamEnabled {
+		backupURL = c.jetStreamURL
+	}
+	c.fc = msgfailover.NewClient(msgfailover.Config{
+		Primary: msgfailover.AdapterConfig{URL: c.broker, ClientID: c.clientID},
+		Backup:  msgfailover.AdapterConfig{URL: backupURL},
+		Topic:   c.topic,
+		Mode:    msgfailover.ModeStrict,
+	})
+	c.fc.SetOnConnect(func() { c.onConnected() })
+	c.fc.SetOnDisconnect(func(err error) { c.onDisconnected(err) })
+	c.fc.SetOnFailover(func(from, to string) {
+		log.Printf("[MQTT] 故障转移 %s -> %s", from, to)
+	})
+	c.fc.SetOnMessage(func(payload []byte) { c.onMessagePayload(payload) })
+	c.fc.Subscribe(c.topic, 0, func(payload []byte) { c.onMessagePayload(payload) })
 	go func() {
-		for c.running {
-			opts := c.buildOptions()
-			c.client = mqtt.NewClient(opts)
-			token := c.client.Connect()
-			token.Wait()
-			if token.Error() == nil {
-				log.Printf("[MQTT] 已连接 broker=%s topic=%s clientId=%s", c.broker, c.topic, c.clientID)
-				return
-			}
-			log.Printf("[MQTT] 连接失败: %v，5s 后重试", token.Error())
-			time.Sleep(5 * time.Second)
+		if err := c.fc.Connect(); err != nil {
+			log.Printf("[MQTT] 连接失败（主备均不可用）: %v", err)
 		}
 	}()
 	c.wg.Add(3)
 	go c.heartbeatLoop()
 	go c.pushLoop()
 	go c.statusLoop()
-	log.Printf("[MQTT] 接入层已启动（clientId=%s）", c.clientID)
+	log.Printf("[MQTT] 接入层已启动（clientId=%s, jetstream=%v）", c.clientID, c.jetStreamEnabled)
 	return true
 }
 
 // Stop 停止 MQTT 客户端
 func (c *MQTTPriceClient) Stop() {
 	c.running = false
-	if c.client != nil {
-		c.client.Disconnect(250)
+	if c.fc != nil {
+		c.fc.Disconnect(250 * time.Millisecond)
 	}
 	c.wg.Wait()
 	log.Println("[MQTT] 已停止")
 }
 
-func (c *MQTTPriceClient) onConnect(client mqtt.Client) {
-	c.connected = true
-	if token := client.Subscribe(c.topic, 0, nil); token.Wait() && token.Error() != nil {
-		log.Printf("[MQTT] 订阅失败: %v", token.Error())
+// SetBackupURL 运行时更新 JetStream/NATS 备服务器地址（供 mDNS Watch 在 NATS
+// 服务器 IP 变化后重新指向正确地址）。仅作委托，实际逻辑在故障转移库。
+func (c *MQTTPriceClient) SetBackupURL(url string) {
+	if c.fc != nil {
+		c.fc.SetBackupURL(url)
 	}
+}
+
+func (c *MQTTPriceClient) onConnected() {
+	c.connected = true
 	c.sendRaw("ping", "_ping")
 	c.sendStatus()
 }
 
-func (c *MQTTPriceClient) onDisconnect(client mqtt.Client, err error) {
+func (c *MQTTPriceClient) onDisconnected(err error) {
 	c.connected = false
-	log.Printf("[MQTT] 连接断开（将自动重连）: %v", err)
+	log.Printf("[MQTT] 连接断开（故障转移中）: %v", err)
 }
 
-func (c *MQTTPriceClient) onMessage(client mqtt.Client, msg mqtt.Message) {
-	payload := string(msg.Payload())
-	plaintext, err := decrypt(payload, c.password)
+func (c *MQTTPriceClient) onMessagePayload(payload []byte) {
+	plaintext, err := decrypt(string(payload), c.password)
 	if err != nil {
 		log.Printf("[MQTT] 解密失败（密钥不匹配?）: %v", err)
 		return
@@ -731,7 +723,7 @@ func (c *MQTTPriceClient) subsKeys() []string {
 }
 
 func (c *MQTTPriceClient) publish(msgContent string, msgID string) {
-	if c.client == nil {
+	if c.fc == nil {
 		return
 	}
 	if msgID == "" {
@@ -753,7 +745,7 @@ func (c *MQTTPriceClient) publish(msgContent string, msgID string) {
 		log.Printf("[MQTT] 加密失败: %v", err)
 		return
 	}
-	c.client.Publish(c.topic, 0, false, cipher)
+	c.fc.Publish(c.topic, []byte(cipher))
 }
 
 func (c *MQTTPriceClient) sendRaw(msgContent string, suffix string) {

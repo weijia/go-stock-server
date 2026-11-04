@@ -13,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	natsdiscovery "github.com/stock-server/nats-discovery"
 )
 
 // ServerConfig 是干净的配置结构（方案 B / C 首选）
@@ -33,6 +35,9 @@ type ServerConfig struct {
 	MQTTUserSuffix      string
 	MQTTPushInterval    int
 	MQTTPushOnlyTrading bool
+	JetStreamURL        string
+	JetStreamEnabled    bool
+	JetStreamDiscover   bool
 }
 
 // DefaultConfig 返回基于 flag 默认值 + env 默认值的等价配置
@@ -49,6 +54,9 @@ func DefaultConfig() ServerConfig {
 		MQTTTopic:           "secure/stock-price-mqtt",
 		MQTTPassword:        "stock_price_mqtt_S3cret",
 		MQTTPushInterval:    5,
+		JetStreamURL:        "nats://127.0.0.1:4222",
+		JetStreamEnabled:    false,
+		JetStreamDiscover:   false,
 	}
 }
 
@@ -90,6 +98,9 @@ func RunLegacyMain(args []string, block bool) (*RunningServer, error) {
 		mqttUserSuffix      string
 		mqttPushInterval    int
 		mqttPushOnlyTrading bool
+		jetStreamURL        string
+		jetStreamEnabled    bool
+		jetStreamDiscover   bool
 	)
 
 	fs := flag.NewFlagSet("go-stock-server", flag.ContinueOnError)
@@ -110,6 +121,9 @@ func RunLegacyMain(args []string, block bool) (*RunningServer, error) {
 	mqttUserSuffix = getEnv("MQTT_USER_SUFFIX", "")
 	mqttPushInterval = getEnvInt("MQTT_PUSH_INTERVAL", 5)
 	mqttPushOnlyTrading = getEnvBool("MQTT_PUSH_ONLY_TRADING", false)
+	jetStreamURL = getEnv("JETSTREAM_URL", "nats://127.0.0.1:4222")
+	jetStreamEnabled = getEnvBool("JETSTREAM_ENABLED", false)
+	jetStreamDiscover = getEnvBool("JETSTREAM_DISCOVER", false)
 
 	fs.BoolVar(&mqttEnabled, "mqtt", mqttEnabled, "启用 MQTT 接入层（默认开启，-mqtt=false 关闭）")
 	fs.StringVar(&mqttBroker, "mqtt-broker", mqttBroker, "MQTT broker 地址")
@@ -119,6 +133,9 @@ func RunLegacyMain(args []string, block bool) (*RunningServer, error) {
 	fs.StringVar(&mqttUserSuffix, "mqtt-user-suffix", mqttUserSuffix, "附加 ping user 后缀")
 	fs.IntVar(&mqttPushInterval, "mqtt-push-interval", mqttPushInterval, "实时价推送间隔(秒)")
 	fs.BoolVar(&mqttPushOnlyTrading, "mqtt-push-only-trading", mqttPushOnlyTrading, "仅交易时段推送")
+	fs.StringVar(&jetStreamURL, "jetstream-url", jetStreamURL, "JetStream/NATS 备服务器地址（MQTT 不可用时故障转移目标）")
+	fs.BoolVar(&jetStreamEnabled, "jetstream", jetStreamEnabled, "启用 JetStream 备服务器故障转移（默认关闭）")
+	fs.BoolVar(&jetStreamDiscover, "jetstream-discover", jetStreamDiscover, "通过 mDNS 自动发现 NATS/JetStream 服务器（覆盖 jetstream-url 并强制启用故障转移）")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -141,6 +158,9 @@ func RunLegacyMain(args []string, block bool) (*RunningServer, error) {
 		MQTTUserSuffix:      mqttUserSuffix,
 		MQTTPushInterval:    mqttPushInterval,
 		MQTTPushOnlyTrading: mqttPushOnlyTrading,
+		JetStreamURL:        jetStreamURL,
+		JetStreamEnabled:    jetStreamEnabled,
+		JetStreamDiscover:   jetStreamDiscover,
 	}
 	return startFromConfig(cfg, block)
 }
@@ -153,6 +173,21 @@ func StartServer(cfg ServerConfig, block bool) (*RunningServer, error) {
 // startFromConfig —— 真正的启动逻辑，与原 main() 行为 1:1
 func startFromConfig(cfg ServerConfig, block bool) (*RunningServer, error) {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+
+	// 通过 mDNS 自动发现 NATS/JetStream 服务器（覆盖 jetstream-url 并强制启用故障转移）。
+	if cfg.JetStreamDiscover {
+		log.Println("[启动] 通过 mDNS 自动发现 NATS/JetStream 服务器...")
+		urls, err := natsdiscovery.Discover(3 * time.Second)
+		if err != nil || len(urls) == 0 {
+			log.Printf("[启动] ⚠️ mDNS 未发现 NATS 服务器，JetStream 故障转移将禁用（仅 MQTT）: %v", err)
+			cfg.JetStreamEnabled = false
+		} else {
+			log.Printf("[启动] ✅ mDNS 发现 NATS 服务器: %v", urls)
+			cfg.JetStreamURL = urls[0]
+			cfg.JetStreamEnabled = true
+		}
+	}
+
 	log.Println("[启动 step 1/8] 开始初始化 StockFetcher")
 	if cfg.Debug {
 		log.Println("DEBUG 模式已启用，将显示详细请求/响应日志")
@@ -182,6 +217,10 @@ func startFromConfig(cfg ServerConfig, block bool) (*RunningServer, error) {
 			}
 		}
 		log.Println("[启动 step 2/8] TDX 数据源完成")
+		// 启动后台自动重连：TDX 未连接时周期性重测速，等待可用服务器窗口。
+		if tdxDS != nil {
+			tdxDS.StartAutoReconnect()
+		}
 	} else {
 		log.Println("[启动 step 2/8] TDX 未启用，跳过")
 	}
@@ -240,9 +279,24 @@ func startFromConfig(cfg ServerConfig, block bool) (*RunningServer, error) {
 		}
 		log.Printf("[启动 step 7/8] 初始化 MQTT... (broker=%s topic=%s)", cfg.MQTTBroker, cfg.MQTTTopic)
 		mqttClient = NewMQTTClient(handler, cfg.MQTTBroker, cfg.MQTTTopic, cfg.MQTTPassword,
-			cfg.MQTTClientID, cfg.MQTTUserSuffix, cfg.MQTTPushInterval, cfg.MQTTPushOnlyTrading)
+			cfg.MQTTClientID, cfg.MQTTUserSuffix, cfg.MQTTPushInterval, cfg.MQTTPushOnlyTrading,
+			cfg.JetStreamURL, cfg.JetStreamEnabled)
 		mqttClient.Start()
 		log.Println("[启动 step 7/8] MQTT 完成")
+
+		// 持续监听 NATS/JetStream 服务器：若其 IP 变化（如休眠唤醒换 DHCP 地址），
+		// 自动把备服务器地址重新指向新地址，保证故障转移目标始终可达。
+		if cfg.JetStreamDiscover && cfg.JetStreamEnabled {
+			go func() {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				_ = natsdiscovery.Watch(ctx, func(urls []string) {
+					if len(urls) > 0 {
+						mqttClient.SetBackupURL(urls[0])
+					}
+				})
+			}()
+		}
 	} else {
 		log.Println("[启动 step 7/8] MQTT 未启用，跳过")
 	}

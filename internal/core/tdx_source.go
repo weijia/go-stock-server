@@ -5,9 +5,16 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	tdx "github.com/weijia/go-tdx"
+)
+
+// 失败切换阈值与重连周期（对齐 python mootdx_client 的机制）
+const (
+	tdxFailSwitchThreshold = 5                // 连续取数失败达到该次数触发后台重测速
+	tdxRetryInterval       = 30 * time.Second // 未连接时周期性自动重连的最小间隔
 )
 
 // TdxDataSource 通达信 TCP 行情数据源
@@ -15,6 +22,10 @@ type TdxDataSource struct {
 	provider *tdx.Provider
 	enabled  bool
 	debug    bool
+
+	retryMu   sync.Mutex
+	failCount int       // 连续取数失败计数
+	lastRetry time.Time // 最近一次自动重连/重测速时间（节流用）
 }
 
 // NewTdxDataSource 创建通达信数据源
@@ -56,12 +67,87 @@ func (ds *TdxDataSource) Close() {
 	ds.enabled = false
 }
 
+// ── 失败自动重测速 / 未连接自动重连（对齐 python mootdx_client 机制）────────
+
+// noteResult 记录一次取数成败。连续失败达到阈值时触发后台重测速切换服务器；
+// 成功则清零计数。
+func (ds *TdxDataSource) noteResult(ok bool) {
+	ds.retryMu.Lock()
+	if ok {
+		ds.failCount = 0
+		ds.retryMu.Unlock()
+		return
+	}
+	ds.failCount++
+	trigger := ds.failCount >= tdxFailSwitchThreshold
+	ds.retryMu.Unlock()
+	if trigger {
+		ds.scheduleReconnect("连续取数失败")
+	}
+}
+
+// maybeAutoReconnect 在数据源未连接时周期性尝试重连（节流），让 go 版能像
+// python 版一样"等到/撞上"某台服务器可用的窗口，而不是启动失败就永久禁用。
+func (ds *TdxDataSource) maybeAutoReconnect() {
+	if ds.Enabled() {
+		return
+	}
+	ds.retryMu.Lock()
+	now := time.Now()
+	if now.Sub(ds.lastRetry) < tdxRetryInterval {
+		ds.retryMu.Unlock()
+		return
+	}
+	ds.lastRetry = now
+	ds.retryMu.Unlock()
+	ds.scheduleReconnect("自动重连")
+}
+
+// StartAutoReconnect 启动后台自动重连协程：未连接时周期性重测速。
+// handler 在 TDX 未连接时会直接走 HTTP 兜底、不进入 tdxDS 方法，因此必须
+// 由独立协程驱动重连（对齐 python mootdx_client 启动即 start_bench 后台测速）。
+func (ds *TdxDataSource) StartAutoReconnect() {
+	go func() {
+		for {
+			time.Sleep(tdxRetryInterval)
+			ds.maybeAutoReconnect()
+		}
+	}()
+}
+
+// scheduleReconnect 异步重测速并切换到最优可用服务器（不阻塞当前请求）。
+func (ds *TdxDataSource) scheduleReconnect(reason string) {
+	go func() {
+		if ds.debug {
+			log.Printf("[TDX] ⚠️ 触发重测速（%s），重新选择最优服务器...", reason)
+		}
+		err := ds.provider.ConnectBest()
+		ds.retryMu.Lock()
+		if err == nil {
+			ds.enabled = true
+			ds.failCount = 0
+			if ds.debug {
+				log.Println("[TDX] ✅ 重测速后重新连接成功")
+			}
+		} else if ds.debug {
+			log.Printf("[TDX] ⚠️ 重测速仍失败: %v", err)
+		}
+		ds.retryMu.Unlock()
+	}()
+}
+
+// unconnectedErr 在未连接时的统一出口：周期性触发自动重连后返回错误。
+func (ds *TdxDataSource) unconnectedErr() error {
+	ds.maybeAutoReconnect()
+	return fmt.Errorf("TDX 数据源未连接")
+}
+
 // ── 接口适配 (返回格式与现有 fetcher 兼容) ─────────────────────────────────
 
 // GetKline 通过通达信获取K线数据
 func (ds *TdxDataSource) GetKline(code string, days int) (*KlineResponse, error) {
 	if !ds.Enabled() {
-		return nil, fmt.Errorf("TDX 数据源未连接")
+		return nil, ds.unconnectedErr()
 	}
 
 	market := tdx.ResolveMarket(code)
@@ -69,8 +155,10 @@ func (ds *TdxDataSource) GetKline(code string, days int) (*KlineResponse, error)
 
 	bars, err := ds.provider.GetKline(uint16(category), uint16(market), code, 0, uint16(days))
 	if err != nil {
+		ds.noteResult(false)
 		return nil, fmt.Errorf("TDX K线获取失败 [%s]: %w", code, err)
 	}
+	ds.noteResult(true)
 
 	var records []KlineRecord
 	for _, bar := range bars {
@@ -95,14 +183,16 @@ func (ds *TdxDataSource) GetKline(code string, days int) (*KlineResponse, error)
 // GetRealtime 通过通达信获取实时行情
 func (ds *TdxDataSource) GetRealtime(code string) (*RealtimeData, error) {
 	if !ds.Enabled() {
-		return nil, fmt.Errorf("TDX 数据源未连接")
+		return nil, ds.unconnectedErr()
 	}
 
 	market := tdx.ResolveMarket(code)
 	bars, err := ds.provider.GetKline(uint16(tdx.CategoryKLineDay), uint16(market), code, 0, 2)
 	if err != nil {
+		ds.noteResult(false)
 		return nil, fmt.Errorf("TDX 实时行情获取失败 [%s]: %w", code, err)
 	}
+	ds.noteResult(true)
 
 	if len(bars) == 0 {
 		return nil, fmt.Errorf("TDX 返回空数据 [%s]", code)
@@ -140,15 +230,17 @@ func (ds *TdxDataSource) GetRealtime(code string) (*RealtimeData, error) {
 // 使用 1 分钟 K线模拟分时数据
 func (ds *TdxDataSource) GetIntraday(code string, date string) (*IntradayResponse, error) {
 	if !ds.Enabled() {
-		return nil, fmt.Errorf("TDX 数据源未连接")
+		return nil, ds.unconnectedErr()
 	}
 
 	market := tdx.ResolveMarket(code)
 	// 一分钟K线，获取足够多的数量覆盖全天 (约240根)
 	bars, err := ds.provider.GetKline(uint16(tdx.CategoryKLine1Min), uint16(market), code, 0, 241)
 	if err != nil {
+		ds.noteResult(false)
 		return nil, fmt.Errorf("TDX 分时数据获取失败 [%s]: %w", code, err)
 	}
+	ds.noteResult(true)
 
 	if len(bars) == 0 {
 		return nil, fmt.Errorf("TDX 返回空分时数据 [%s]", code)
@@ -225,12 +317,14 @@ func formatDate(dateStr string) string {
 // 价格分层兜底：price>0 → 实时价；price=0 但昨收>0 → 昨收；否则跳过（交腾讯兜底）。
 func (ds *TdxDataSource) GetBatchQuotes(codes []string) (map[string]*QuoteRecord, error) {
 	if !ds.Enabled() {
-		return nil, fmt.Errorf("TDX 数据源未连接")
+		return nil, ds.unconnectedErr()
 	}
 	quotes, err := ds.provider.GetQuotesBatch(codes)
 	if err != nil {
+		ds.noteResult(false)
 		return nil, fmt.Errorf("TDX 批量行情失败: %w", err)
 	}
+	ds.noteResult(true)
 
 	result := make(map[string]*QuoteRecord)
 	now := time.Now().Unix()
@@ -265,7 +359,7 @@ func (ds *TdxDataSource) GetBatchQuotes(codes []string) (map[string]*QuoteRecord
 // GetMinute 通过通达信获取分钟 K 线（原始 OHLC 棒）
 func (ds *TdxDataSource) GetMinute(code string, period int, minutes int) (*MinuteResponse, error) {
 	if !ds.Enabled() {
-		return nil, fmt.Errorf("TDX 数据源未连接")
+		return nil, ds.unconnectedErr()
 	}
 	market := tdx.ResolveMarket(code)
 	cat, ok := minuteCategory(period)
@@ -277,8 +371,10 @@ func (ds *TdxDataSource) GetMinute(code string, period int, minutes int) (*Minut
 	}
 	bars, err := ds.provider.GetKline(uint16(cat), uint16(market), code, 0, uint16(minutes))
 	if err != nil {
+		ds.noteResult(false)
 		return nil, fmt.Errorf("TDX 分钟K线失败 [%s]: %w", code, err)
 	}
+	ds.noteResult(true)
 	if len(bars) == 0 {
 		return nil, fmt.Errorf("TDX 分钟K线为空 [%s]", code)
 	}

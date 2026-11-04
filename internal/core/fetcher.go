@@ -86,18 +86,87 @@ func marketPrefix(code string) string {
 	return "sz"
 }
 
-// FetchRealtime 获取实时行情
+// FetchRealtime 获取实时行情（多源兜底：腾讯 → 新浪）。
+// 腾讯 qt.gtimg.cn 是本环境可达主源；若被拦/失败，回退新浪 hq.sinajs.cn
+// （对齐 Python 多网络源策略）。港股新浪格式不同，保持腾讯单源。
 func (f *StockFetcher) FetchRealtime(code string) (*RealtimeData, error) {
 	prefix := marketPrefix(code)
 	sym := apiCode(code)
 	url := fmt.Sprintf("http://qt.gtimg.cn/q=%s%s", prefix, sym)
 
 	body, err := f.httpGet(url)
-	if err != nil {
-		return nil, fmt.Errorf("请求实时行情失败: %w", err)
+	if err == nil {
+		return f.parseRealtime(body, code)
 	}
+	if !isHKCode(code) {
+		if rt, serr := f.fetchRealtimeSina(code); serr == nil {
+			return rt, nil
+		}
+	}
+	return nil, err
+}
 
-	return f.parseRealtime(body, code)
+// fetchRealtimeSina 新浪实时行情（hq.sinajs.cn，GBK 编码，需 Referer）。
+func (f *StockFetcher) fetchRealtimeSina(code string) (*RealtimeData, error) {
+	prefix := marketPrefix(code)
+	sym := apiCode(code)
+	url := fmt.Sprintf("https://hq.sinajs.cn/list=%s%s", prefix, sym)
+	body, err := f.httpGetWithHeaders(url, map[string]string{
+		"Referer": "https://finance.sina.com.cn/",
+	}, 8*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("新浪实时请求失败: %w", err)
+	}
+	return f.parseRealtimeSina(body, code)
+}
+
+// parseRealtimeSina 解析新浪实时：var hq_str_sh600000="名称,今开,昨收,现价,最高,最低,...";
+// 成交量单位=股，成交额单位=元（与 RealtimeData 契约一致）。
+func (f *StockFetcher) parseRealtimeSina(content, code string) (*RealtimeData, error) {
+	content = gbkToUtf8([]byte(content))
+	key := fmt.Sprintf("hq_str_%s%s=", marketPrefix(code), apiCode(code))
+	idx := strings.Index(content, key)
+	if idx < 0 {
+		return nil, fmt.Errorf("未找到新浪股票 %s 数据", code)
+	}
+	start := idx + len(key)
+	if start < len(content) && content[start] == '"' {
+		start++
+	}
+	end := strings.Index(content[start:], "\"")
+	if end < 0 {
+		return nil, fmt.Errorf("解析新浪响应格式失败")
+	}
+	parts := strings.Split(content[start:start+end], ",")
+	if len(parts) < 10 {
+		return nil, fmt.Errorf("新浪字段不足(%d)", len(parts))
+	}
+	name := parts[0]
+	if name == "" {
+		name = code
+	}
+	f.setNameCache(code, name)
+
+	lastClose := parseFloatSafe(parts[2])
+	price := parseFloatSafe(parts[3])
+	changeAmt, changePct := 0.0, 0.0
+	if lastClose > 0 {
+		changeAmt = price - lastClose
+		changePct = changeAmt / lastClose * 100
+	}
+	return &RealtimeData{
+		Name:      name,
+		Code:      code,
+		Price:     price,
+		LastClose: lastClose,
+		Open:      parseFloatSafe(parts[1]),
+		High:      parseFloatSafe(parts[4]),
+		Low:       parseFloatSafe(parts[5]),
+		Volume:    parseFloatSafe(parts[8]),
+		Amount:    parseFloatSafe(parts[9]),
+		ChangeAmt: changeAmt,
+		ChangePct: changePct,
+	}, nil
 }
 
 // K 线缓存（对齐 Python _kline_cache）：新鲜期内直接返回；全部源失败回退 stale TTL 内旧值。
@@ -483,10 +552,13 @@ func minuteTdxKey(period int) string {
 	}
 }
 
-// normalizeMinuteDate 将腾讯/东财分钟时间戳（"2026-09-25 14:55"）统一为
-// ISO8601（"2026-09-25T14:55:00"），便于前端/客户端稳健解析。
+// normalizeMinuteDate 将腾讯/东财/新浪分钟时间戳统一为 ISO8601（"2026-09-25T14:55:00"）。
+// 兼容带秒（新浪 "2026-10-27 15:00:00"）与不带秒（东财/腾讯 "2026-09-25 14:55"）两种布局。
 func normalizeMinuteDate(s string) string {
 	s = strings.TrimSpace(s)
+	if t, err := time.Parse("2006-01-02 15:04:05", s); err == nil {
+		return t.Format("2006-01-02T15:04:05")
+	}
 	if t, err := time.Parse("2006-01-02 15:04", s); err == nil {
 		return t.Format("2006-01-02T15:04:05")
 	}
@@ -495,19 +567,28 @@ func normalizeMinuteDate(s string) string {
 
 // FetchMinute 通过 HTTP 行情源获取分钟 K 线（TDX 不可用时的兜底）。
 // period 沿用 mootdx 周期码：0=5分,1=15分,2=30分,3=60分,7=1分。
-// 优先腾讯(ifzq.gtimg.cn，与分时同域、本机已验证可达)，回退东财(klt 多周期)。
+// 多源顺序：腾讯(ifzq.gtimg.cn) → 新浪(quotes.sina.cn，本环境可达，对齐 Python 新浪分钟源)
+// → 东财(klt 多周期，本环境常被掐 EOF，作为最末兜底)。
 // 返回的 Date 统一为 ISO8601，避免消费端解析不一致。
 func (f *StockFetcher) FetchMinute(code string, period int, minutes int) (*MinuteResponse, error) {
 	if minutes <= 0 {
 		minutes = 300
 	}
-	var tErr, eErr error
+	var tErr, sErr, eErr error
 	if data, err := f.fetchMinuteTencent(code, period, minutes); err == nil && data != nil && data.Count > 0 {
 		return data, nil
 	} else if err != nil {
 		tErr = err
 		if f.debug {
 			log.Printf("[MINUTE] 腾讯分钟K线失败 [%s]: %v", code, err)
+		}
+	}
+	if data, err := f.fetchMinuteSina(code, period, minutes); err == nil && data != nil && data.Count > 0 {
+		return data, nil
+	} else if err != nil {
+		sErr = err
+		if f.debug {
+			log.Printf("[MINUTE] 新浪分钟K线失败 [%s]: %v", code, err)
 		}
 	}
 	if data, err := f.fetchMinuteEastMoney(code, period, minutes); err == nil && data != nil && data.Count > 0 {
@@ -518,7 +599,76 @@ func (f *StockFetcher) FetchMinute(code string, period int, minutes int) (*Minut
 			log.Printf("[MINUTE] 东财分钟K线失败 [%s]: %v", code, err)
 		}
 	}
-	return nil, fmt.Errorf("腾讯(%v) 东财(%v) 分钟K线均不可用 [%s]", tErr, eErr, code)
+	return nil, fmt.Errorf("腾讯(%v) 新浪(%v) 东财(%v) 分钟K线均不可用 [%s]", tErr, sErr, eErr, code)
+}
+
+// minuteSinaScale 将 mootdx 周期码映射为新浪分钟 scale（1/5/15/30/60）。
+func minuteSinaScale(period int) int {
+	switch period {
+	case 0:
+		return 5
+	case 1:
+		return 15
+	case 2:
+		return 30
+	case 3:
+		return 60
+	case 7:
+		return 1
+	default:
+		return 5
+	}
+}
+
+// fetchMinuteSina 新浪多周期分钟 K 线（quotes.sina.cn，与新浪日K同接口，scale=分钟周期）。
+// 与 python mootdx 分钟兜底源一致，本环境可达。
+func (f *StockFetcher) fetchMinuteSina(code string, period int, minutes int) (*MinuteResponse, error) {
+	prefix := marketPrefix(code)
+	sym := apiCode(code)
+	scale := minuteSinaScale(period)
+	url := fmt.Sprintf("https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketData.getKLineData?symbol=%s%s&scale=%d&ma=no&datalen=%d", prefix, sym, scale, minutes)
+	body, err := f.httpGetWithHeaders(url, map[string]string{
+		"Referer": "https://finance.sina.com.cn/",
+	}, 8*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("新浪分钟K线请求失败: %w", err)
+	}
+	return f.parseMinuteSina(body, code, minutes)
+}
+
+// parseMinuteSina 解析新浪分钟 K 线：getKLineData 返回
+// [{"day":"2026-10-27 15:00:00","open":"..","high":"..","low":"..","close":"..","volume":".."}, ...]。
+// 与 parseKlineSina（日K）不同：必须保留 day 的时间部分，统一为 ISO8601。
+func (f *StockFetcher) parseMinuteSina(content, code string, minutes int) (*MinuteResponse, error) {
+	var rows []struct {
+		Day    string `json:"day"`
+		Open   string `json:"open"`
+		High   string `json:"high"`
+		Low    string `json:"low"`
+		Close  string `json:"close"`
+		Volume string `json:"volume"`
+	}
+	if err := json.Unmarshal([]byte(content), &rows); err != nil {
+		return nil, fmt.Errorf("新浪分钟K线解析失败: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("新浪分钟K线数据未找到 %s", code)
+	}
+	records := make([]KlineRecord, 0, len(rows))
+	for _, r := range rows {
+		records = append(records, KlineRecord{
+			Date:   normalizeMinuteDate(r.Day),
+			Open:   parseFloatSafe(r.Open),
+			Close:  parseFloatSafe(r.Close),
+			High:   parseFloatSafe(r.High),
+			Low:    parseFloatSafe(r.Low),
+			Volume: parseFloatSafe(r.Volume),
+		})
+	}
+	if len(records) > minutes {
+		records = records[len(records)-minutes:]
+	}
+	return &MinuteResponse{Code: code, Count: len(records), Data: records}, nil
 }
 
 // fetchMinuteTencent 腾讯多周期分钟 K 线（与分时同域 ifzq.gtimg.cn）。
@@ -1134,8 +1284,9 @@ func (f *StockFetcher) FetchName(code string) (string, error) {
 	return rt.Name, nil
 }
 
-// FetchBatchQuotes 批量获取实时行情（腾讯 HTTP：一次取多只收盘价/实时价）
-// 返回键为 6 位代码。price_source 默认标 "close"（TDX 优先生效时由调用方覆盖）。
+// FetchBatchQuotes 批量获取实时行情（多源兜底：腾讯 → 新浪，对齐 Python 多网络源）。
+// 腾讯一次取全部；失败时回退新浪逐只解析。返回键为 6 位代码。
+// price_source 默认标 "close"（TDX 优先生效时由调用方覆盖）。
 func (f *StockFetcher) FetchBatchQuotes(codes []string) (map[string]*QuoteRecord, error) {
 	if len(codes) == 0 {
 		return nil, fmt.Errorf("codes 为空")
@@ -1146,10 +1297,94 @@ func (f *StockFetcher) FetchBatchQuotes(codes []string) (map[string]*QuoteRecord
 	}
 	url := fmt.Sprintf("http://qt.gtimg.cn/q=%s", strings.Join(parts, ","))
 	body, err := f.httpGet(url)
-	if err != nil {
-		return nil, fmt.Errorf("请求批量行情失败: %w", err)
+	if err == nil {
+		return f.parseBatchQuotes(body, codes)
 	}
-	return f.parseBatchQuotes(body, codes)
+	// 腾讯失败 → 新浪批量兜底（仅 A股/ETF；港股新浪格式不同）
+	if !anyHK(codes) {
+		if m, serr := f.fetchBatchQuotesSina(codes); serr == nil && len(m) > 0 {
+			return m, nil
+		}
+	}
+	return nil, fmt.Errorf("请求批量行情失败: %w", err)
+}
+
+// anyHK 判断代码列表中是否含港股。
+func anyHK(codes []string) bool {
+	for _, c := range codes {
+		if isHKCode(c) {
+			return true
+		}
+	}
+	return false
+}
+
+// fetchBatchQuotesSina 新浪批量实时行情（一次请求多只，GBK 编码，需 Referer）。
+func (f *StockFetcher) fetchBatchQuotesSina(codes []string) (map[string]*QuoteRecord, error) {
+	syms := make([]string, 0, len(codes))
+	nonHK := make([]string, 0, len(codes))
+	for _, c := range codes {
+		if isHKCode(c) {
+			continue
+		}
+		syms = append(syms, marketPrefix(c)+apiCode(c))
+		nonHK = append(nonHK, c)
+	}
+	if len(syms) == 0 {
+		return nil, fmt.Errorf("无可新浪批量代码")
+	}
+	url := fmt.Sprintf("https://hq.sinajs.cn/list=%s", strings.Join(syms, ","))
+	body, err := f.httpGetWithHeaders(url, map[string]string{
+		"Referer": "https://finance.sina.com.cn/",
+	}, 8*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("新浪批量请求失败: %w", err)
+	}
+	text := gbkToUtf8([]byte(body))
+	result := make(map[string]*QuoteRecord)
+	now := time.Now().Unix()
+	for i, c := range nonHK {
+		marker := fmt.Sprintf("hq_str_%s=", syms[i])
+		idx := strings.Index(text, marker)
+		if idx < 0 {
+			continue
+		}
+		start := idx + len(marker)
+		if start < len(text) && text[start] == '"' {
+			start++
+		}
+		end := strings.Index(text[start:], "\"")
+		if end < 0 {
+			continue
+		}
+		parts := strings.Split(text[start:start+end], ",")
+		if len(parts) < 10 {
+			continue
+		}
+		name := parts[0]
+		if name == "" {
+			name = c
+		}
+		f.setNameCache(c, name)
+		result[c] = &QuoteRecord{
+			Code:        c,
+			Name:        name,
+			Price:       parseFloatSafe(parts[3]),
+			PrevClose:   parseFloatSafe(parts[2]),
+			Open:        parseFloatSafe(parts[1]),
+			High:        parseFloatSafe(parts[4]),
+			Low:         parseFloatSafe(parts[5]),
+			Volume:      parseFloatSafe(parts[8]),
+			Amount:      parseFloatSafe(parts[9]),
+			PriceSource: "close",
+			Stale:       false,
+			PriceTS:     now,
+		}
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("新浪未解析到任何行情")
+	}
+	return result, nil
 }
 
 func (f *StockFetcher) parseBatchQuotes(content string, codes []string) (map[string]*QuoteRecord, error) {
