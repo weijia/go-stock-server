@@ -30,8 +30,13 @@
 | 加密 | CryptoJS.AES | `Salted__` + EVP_BytesToKey(MD5) + AES-256-CBC，与 CryptoJS 互通 |
 | 信封 | `{id, msgId, user, msg(JSON 字符串), time}` | `MQTTPriceClient.publish()` 同结构 |
 | 订阅 | `{action:'subscribe', data:{codes, interval}}` | `handleSubscription()`：subscribe / unsubscribe / list_subs |
-| 报价 | 只认 `{action:'quote_push', data:{code,name,price,open,prev_close,change_pct,price_ts,stale}}` | `pushLoop()` 按 `pushInterval` 逐只推送，字段一致 |
+| 报价 | 只认 `action:'quote_push'`；`data` 为**数组**（一轮全量 batch）或单个对象（旧格式兼容） | `pushLoop()` 按 `pushInterval` 每轮**合并成一条** `quote_push`；`data` 为数组并附 `batch/count/total/push_time`；`MQTT_PUSH_BATCH=false` 可回退逐只推送 |
 | 自消息过滤 | `envelope.id === clientId` 时忽略 | `onMessage()` 中 `senderID == c.clientID` 直接 return |
+
+**报价负载（协议 v2，2026-11-09 起）**：
+`{"action":"quote_push","batch":true,"count":99,"total":99,"push_time":...,"data":[{code,name,price,open,prev_close,high,low,change_pct,price_ts,push_time,stale}, ...]}`。
+改为单条 batch 的原因：公共 broker 对 100+ 条 QoS0 突发会限流丢弃后续消息，而推送循环每轮又从排序后的订阅表头重新开始，导致排在后面的代码（如 600699）长期收不到价。
+三个订阅端（my-quant / trade-dashboard / 平安条件单脚本）均按 `Array.isArray(data)` 遍历，同时兼容旧的单只格式；订阅数超过 200 只时服务端按 200 分块，避免单条报文超限。
 
 服务端另有一批 my-quant 当前未使用的请求-响应式命令：`realtime`、`batch`、`kline`、`qfq`、`minute`、`intraday`、`name`、`quote_cache`、`health`、`config`，响应包成 `{action:'response', data:{...}}`。my-quant 只解析 `quote_push`，这些 `response` 会被静默丢弃。
 
@@ -161,6 +166,8 @@ if h.tdx == nil || !h.tdx.Enabled() {
 收到 action=response body={"action":"response","data":{"action":"subscribe","data":{"count":1,"push_interval":5,"subscribed":["600519"]},"status":"success"}}
 收到 action=quote_push body={"action":"quote_push","data":{"change_pct":2.0972,"code":"600519","name":"贵州茅台","price":1312.97,"prev_close":1286,"stale":false,...}}
 ```
+> 上例是协议 v2 之前的历史验证输出（单只 `data` 对象）。当前每轮为一条 batch：
+> `data` 为数组并附 `batch/count/total/push_time`，各订阅端按 `Array.isArray(data)` 遍历。
 
 ## 已知问题（未修复）
 

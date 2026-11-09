@@ -1,7 +1,8 @@
 // go-stock-server/mqtt.go - MQTT 接入层（实时价推送 + 行情命令响应）
 //
 // 与 Python mqtt_protocol.py 对齐：OpenSSL 兼容 AES 加密、信封/msgId 去重、
-// 自消息过滤、ping-pong、subscribe/unsubscribe/list_subs、quote_push 推送、
+// 自消息过滤、ping-pong、subscribe/unsubscribe/list_subs、quote_push 推送
+// （协议 v2：每轮合并成一条 batch，data 为数组；MQTT_PUSH_BATCH=false 回退逐只）、
 // 行情命令 (realtime/batch/kline/qfq/minute/intraday/name/quote_cache/health/config)。
 package core
 
@@ -180,12 +181,12 @@ func (ch *mqttCommandHandler) kline(data map[string]interface{}) map[string]inte
 		return errResp("kline", fmt.Sprintf("无可用数据源: %v", err), code)
 	}
 	return okResp("kline", map[string]interface{}{
-		"code":    code,
-		"name":    resp.Name,
-		"count":   resp.Count,
-		"data":    resp.Data,
-		"stale":   stale,
-		"source":  src,
+		"code":     code,
+		"name":     resp.Name,
+		"count":    resp.Count,
+		"data":     resp.Data,
+		"stale":    stale,
+		"source":   src,
 		"price_ts": time.Now().Format(time.RFC3339),
 	}, code)
 }
@@ -272,8 +273,8 @@ func (ch *mqttCommandHandler) intraday(data map[string]interface{}) map[string]i
 		}
 		dateSet[dayPart] = true
 		intradayData = append(intradayData, map[string]interface{}{
-			"time":  tm,
-			"price": price,
+			"time":   tm,
+			"price":  price,
 			"volume": vol,
 		})
 	}
@@ -355,9 +356,9 @@ func (ch *mqttCommandHandler) config() map[string]interface{} {
 		dataSource = "通达信TCP优先 + 腾讯HTTP回退"
 	}
 	sources := map[string]interface{}{
-		"mootdx_tcp":  tdxEnabled,
+		"mootdx_tcp":   tdxEnabled,
 		"tencent_http": true,
-		"best_server": nil,
+		"best_server":  nil,
 	}
 	caps := map[string]interface{}{
 		"realtime_single":  true,
@@ -429,14 +430,15 @@ func parseBrokerURL(raw string) (scheme, host string, port int, path string) {
 
 // MQTTPriceClient Price Server 的 MQTT 客户端
 type MQTTPriceClient struct {
-	handler *StockHandler
-	broker  string
-	topic   string
-	password string
-	clientID string
-	userSuffix string
-	pushInterval int
+	handler          *StockHandler
+	broker           string
+	topic            string
+	password         string
+	clientID         string
+	userSuffix       string
+	pushInterval     int
 	pushOnlyTrading  bool
+	pushBatch        bool
 	jetStreamURL     string
 	jetStreamEnabled bool
 	wsPath           string
@@ -458,7 +460,7 @@ type MQTTPriceClient struct {
 }
 
 // NewMQTTClient 创建 MQTT 客户端
-func NewMQTTClient(h *StockHandler, broker, topic, password, clientID, userSuffix string, pushInterval int, pushOnlyTrading bool, jetStreamURL string, jetStreamEnabled bool) *MQTTPriceClient {
+func NewMQTTClient(h *StockHandler, broker, topic, password, clientID, userSuffix string, pushInterval int, pushOnlyTrading bool, pushBatch bool, jetStreamURL string, jetStreamEnabled bool) *MQTTPriceClient {
 	if clientID == "" {
 		clientID = "ps_" + randHex(6)
 	}
@@ -475,6 +477,7 @@ func NewMQTTClient(h *StockHandler, broker, topic, password, clientID, userSuffi
 		userSuffix:       userSuffix,
 		pushInterval:     pushInterval,
 		pushOnlyTrading:  pushOnlyTrading,
+		pushBatch:        pushBatch,
 		jetStreamURL:     jetStreamURL,
 		jetStreamEnabled: jetStreamEnabled,
 		wsPath:           wsPath,
@@ -722,30 +725,35 @@ func (c *MQTTPriceClient) subsKeys() []string {
 	return keys
 }
 
-func (c *MQTTPriceClient) publish(msgContent string, msgID string) {
+// publish 返回 error，便于 pushLoop 统计发布失败（此前返回值被丢弃，丢包不可见）。
+func (c *MQTTPriceClient) publish(msgContent string, msgID string) error {
 	if c.fc == nil {
-		return
+		return fmt.Errorf("MQTT 客户端未初始化")
 	}
 	if msgID == "" {
 		msgID = fmt.Sprintf("%d_%s", time.Now().UnixMilli(), randHex(6))
 	}
 	envelope := map[string]interface{}{
-		"id":     c.clientID,
-		"msgId":  msgID,
-		"user":   "price-server" + c.userSuffix,
-		"msg":    msgContent,
-		"time":   time.Now().UnixMilli(),
+		"id":    c.clientID,
+		"msgId": msgID,
+		"user":  "price-server" + c.userSuffix,
+		"msg":   msgContent,
+		"time":  time.Now().UnixMilli(),
 	}
 	plain, err := json.Marshal(envelope)
 	if err != nil {
-		return
+		return err
 	}
 	cipher, err := encrypt(string(plain), c.password)
 	if err != nil {
 		log.Printf("[MQTT] 加密失败: %v", err)
-		return
+		return err
 	}
-	c.fc.Publish(c.topic, []byte(cipher))
+	if err := c.fc.Publish(c.topic, []byte(cipher)); err != nil {
+		log.Printf("[MQTT] publish 失败 msgId=%s: %v", msgID, err)
+		return err
+	}
+	return nil
 }
 
 func (c *MQTTPriceClient) sendRaw(msgContent string, suffix string) {
@@ -799,10 +807,9 @@ func (c *MQTTPriceClient) pushLoop() {
 			log.Printf("[MQTT] 本轮无行情可推送（订阅 %d 只，数据源均失败）", len(codes))
 			continue
 		}
-		if c.handler.debug {
-			log.Printf("[MQTT] 推送 quote_push %d/%d 只", len(quotes), len(codes))
-		}
 		c.handler.quoteCache.UpsertMany(quotes)
+		nowUnix := time.Now().Unix()
+		batch := make([]map[string]interface{}, 0, len(quotes))
 		for _, code := range codes {
 			rec, ok := quotes[code]
 			if !ok || rec == nil || rec.Price <= 0 {
@@ -813,7 +820,7 @@ func (c *MQTTPriceClient) pushLoop() {
 			if pc > 0 {
 				changePct = (rec.Price - pc) / pc * 100
 			}
-			pushData := map[string]interface{}{
+			batch = append(batch, map[string]interface{}{
 				"code":       code,
 				"name":       rec.Name,
 				"price":      rec.Price,
@@ -823,11 +830,61 @@ func (c *MQTTPriceClient) pushLoop() {
 				"low":        rec.Low,
 				"change_pct": roundTo(changePct, 4),
 				"price_ts":   rec.PriceTS,
-				"push_time":  time.Now().Unix(),
+				"push_time":  nowUnix,
 				"stale":      rec.Stale,
+			})
+		}
+		if len(batch) == 0 {
+			continue
+		}
+
+		// 每轮合并成一条 batch quote_push（action 不变，data 改为数组）。
+		// 原先逐只推送 100+ 条 QoS0 突发，会被公共 broker 限流丢弃后续消息；又因每轮
+		// 都从排序后的表头重新开始，排在后面的代码（如 600699）会长期饥饿。
+		// 仅当订阅数极大时按 maxPerMessage 分块，防止单条报文超出 broker 报文上限。
+		// MQTT_PUSH_BATCH=false 可应急回退到旧的逐只格式，兼容尚未升级的客户端。
+		const maxPerMessage = 200
+		msgs, fails := 0, 0
+		if c.pushBatch {
+			for start := 0; start < len(batch); start += maxPerMessage {
+				end := start + maxPerMessage
+				if end > len(batch) {
+					end = len(batch)
+				}
+				inner, err := json.Marshal(map[string]interface{}{
+					"action":    "quote_push",
+					"batch":     true,
+					"count":     end - start,
+					"total":     len(batch),
+					"push_time": nowUnix,
+					"data":      batch[start:end],
+				})
+				if err != nil {
+					log.Printf("[MQTT] quote_push batch 序列化失败: %v", err)
+					fails++
+					continue
+				}
+				msgs++
+				if err := c.publish(string(inner), ""); err != nil {
+					fails++
+				}
 			}
-			inner, _ := json.Marshal(map[string]interface{}{"action": "quote_push", "data": pushData})
-			c.publish(string(inner), "")
+		} else {
+			for _, pushData := range batch {
+				inner, err := json.Marshal(map[string]interface{}{"action": "quote_push", "data": pushData})
+				if err != nil {
+					fails++
+					continue
+				}
+				msgs++
+				if err := c.publish(string(inner), ""); err != nil {
+					fails++
+				}
+			}
+		}
+		if c.handler.debug || fails > 0 {
+			log.Printf("[MQTT] quote_push %d/%d 只, %d 条消息, 失败 %d (batch=%v)",
+				len(batch), len(codes), msgs, fails, c.pushBatch)
 		}
 	}
 }
@@ -849,17 +906,17 @@ func (c *MQTTPriceClient) sendStatus() {
 	tdxEnabled := c.handler.tdx != nil && c.handler.tdx.Enabled()
 	services := []map[string]interface{}{
 		{
-			"name":     "mootdx",
-			"type":     "tdx-tcp",
-			"running":  tdxEnabled,
-			"detail":   "通达信TCP",
+			"name":      "mootdx",
+			"type":      "tdx-tcp",
+			"running":   tdxEnabled,
+			"detail":    "通达信TCP",
 			"available": true,
 		},
 		{
-			"name":     "tencent",
-			"type":     "http",
-			"running":  true,
-			"detail":   "腾讯行情 HTTP",
+			"name":      "tencent",
+			"type":      "http",
+			"running":   true,
+			"detail":    "腾讯行情 HTTP",
 			"available": true,
 		},
 	}
@@ -867,8 +924,8 @@ func (c *MQTTPriceClient) sendStatus() {
 		"action": "status",
 		"data":   services,
 		"extra": map[string]interface{}{
-			"version":         serverVersion,
-			"uptime_seconds":  int(time.Since(serverStartTime).Seconds()),
+			"version":        serverVersion,
+			"uptime_seconds": int(time.Since(serverStartTime).Seconds()),
 		},
 	}
 	plain, _ := json.Marshal(inner)

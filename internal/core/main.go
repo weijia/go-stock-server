@@ -35,6 +35,7 @@ type ServerConfig struct {
 	MQTTUserSuffix      string
 	MQTTPushInterval    int
 	MQTTPushOnlyTrading bool
+	MQTTPushBatch       bool
 	JetStreamURL        string
 	JetStreamEnabled    bool
 	JetStreamDiscover   bool
@@ -43,20 +44,21 @@ type ServerConfig struct {
 // DefaultConfig 返回基于 flag 默认值 + env 默认值的等价配置
 func DefaultConfig() ServerConfig {
 	return ServerConfig{
-		Host:                "0.0.0.0",
-		Port:                8080,
-		SyncInterval:        60,
-		UseTDX:              true,
-		TDXPort:             7709,
-		DBPath:              "../stock/instockdb.sqlite3",
-		EnableMQTT:          true,
-		MQTTBroker:          "wss://broker.emqx.io:8084/mqtt",
-		MQTTTopic:           "secure/stock-price-mqtt",
-		MQTTPassword:        "stock_price_mqtt_S3cret",
-		MQTTPushInterval:    5,
-		JetStreamURL:        "nats://127.0.0.1:4222",
-		JetStreamEnabled:    false,
-		JetStreamDiscover:   false,
+		Host:              "0.0.0.0",
+		Port:              8080,
+		SyncInterval:      60,
+		UseTDX:            true,
+		TDXPort:           7709,
+		DBPath:            "../stock/instockdb.sqlite3",
+		EnableMQTT:        true,
+		MQTTBroker:        "wss://broker.emqx.io:8084/mqtt",
+		MQTTTopic:         "secure/stock-price-mqtt",
+		MQTTPassword:      "stock_price_mqtt_S3cret",
+		MQTTPushInterval:  5,
+		MQTTPushBatch:     true,
+		JetStreamURL:      "nats://127.0.0.1:4222",
+		JetStreamEnabled:  false,
+		JetStreamDiscover: false,
 	}
 }
 
@@ -98,6 +100,7 @@ func RunLegacyMain(args []string, block bool) (*RunningServer, error) {
 		mqttUserSuffix      string
 		mqttPushInterval    int
 		mqttPushOnlyTrading bool
+		mqttPushBatch       bool
 		jetStreamURL        string
 		jetStreamEnabled    bool
 		jetStreamDiscover   bool
@@ -121,6 +124,7 @@ func RunLegacyMain(args []string, block bool) (*RunningServer, error) {
 	mqttUserSuffix = getEnv("MQTT_USER_SUFFIX", "")
 	mqttPushInterval = getEnvInt("MQTT_PUSH_INTERVAL", 5)
 	mqttPushOnlyTrading = getEnvBool("MQTT_PUSH_ONLY_TRADING", false)
+	mqttPushBatch = getEnvBool("MQTT_PUSH_BATCH", true)
 	jetStreamURL = getEnv("JETSTREAM_URL", "nats://127.0.0.1:4222")
 	jetStreamEnabled = getEnvBool("JETSTREAM_ENABLED", false)
 	jetStreamDiscover = getEnvBool("JETSTREAM_DISCOVER", false)
@@ -133,6 +137,7 @@ func RunLegacyMain(args []string, block bool) (*RunningServer, error) {
 	fs.StringVar(&mqttUserSuffix, "mqtt-user-suffix", mqttUserSuffix, "附加 ping user 后缀")
 	fs.IntVar(&mqttPushInterval, "mqtt-push-interval", mqttPushInterval, "实时价推送间隔(秒)")
 	fs.BoolVar(&mqttPushOnlyTrading, "mqtt-push-only-trading", mqttPushOnlyTrading, "仅交易时段推送")
+	fs.BoolVar(&mqttPushBatch, "mqtt-push-batch", mqttPushBatch, "每轮合并成一条 batch quote_push（false 回退逐只推送，兼容旧客户端）")
 	fs.StringVar(&jetStreamURL, "jetstream-url", jetStreamURL, "JetStream/NATS 备服务器地址（MQTT 不可用时故障转移目标）")
 	fs.BoolVar(&jetStreamEnabled, "jetstream", jetStreamEnabled, "启用 JetStream 备服务器故障转移（默认关闭）")
 	fs.BoolVar(&jetStreamDiscover, "jetstream-discover", jetStreamDiscover, "通过 mDNS 自动发现 NATS/JetStream 服务器（覆盖 jetstream-url 并强制启用故障转移）")
@@ -158,6 +163,7 @@ func RunLegacyMain(args []string, block bool) (*RunningServer, error) {
 		MQTTUserSuffix:      mqttUserSuffix,
 		MQTTPushInterval:    mqttPushInterval,
 		MQTTPushOnlyTrading: mqttPushOnlyTrading,
+		MQTTPushBatch:       mqttPushBatch,
 		JetStreamURL:        jetStreamURL,
 		JetStreamEnabled:    jetStreamEnabled,
 		JetStreamDiscover:   jetStreamDiscover,
@@ -280,7 +286,7 @@ func startFromConfig(cfg ServerConfig, block bool) (*RunningServer, error) {
 		log.Printf("[启动 step 7/8] 初始化 MQTT... (broker=%s topic=%s)", cfg.MQTTBroker, cfg.MQTTTopic)
 		mqttClient = NewMQTTClient(handler, cfg.MQTTBroker, cfg.MQTTTopic, cfg.MQTTPassword,
 			cfg.MQTTClientID, cfg.MQTTUserSuffix, cfg.MQTTPushInterval, cfg.MQTTPushOnlyTrading,
-			cfg.JetStreamURL, cfg.JetStreamEnabled)
+			cfg.MQTTPushBatch, cfg.JetStreamURL, cfg.JetStreamEnabled)
 		mqttClient.Start()
 		log.Println("[启动 step 7/8] MQTT 完成")
 
